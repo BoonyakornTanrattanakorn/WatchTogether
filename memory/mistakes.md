@@ -197,6 +197,115 @@ visible by reading CSS and is trivial to measure.
 
 ---
 
+## 5b. `aspect-ratio` silently ignored, so the stage was never the picture
+
+**Reported as:** "there's an aspect ration problem with the current full screen
+button. why not just use media player full screen? it already worked perfectly",
+then — after a first attempt that made it worse — "now there's not subtitle????"
+and "the aspect ratio problem is still here. note that i'm trying to watch 4:3
+video which is different from usual 16:9 screen".
+
+The second report is the one that cracked it. **The file ratio was the variable
+that mattered, and it took being told twice.** Everything had been tested with
+16:9 fixtures, where box and picture coincide and every one of these bugs is
+invisible.
+
+**Actually:** nothing to do with fullscreen — fullscreen was the one geometry
+that was *right*. `#stage` carried `width: 100%; height: 100%` alongside
+`aspect-ratio: var(--ar)`. **`aspect-ratio` is ignored when both axes are
+definite**, so the ratio had never done anything: the stage stretched to fill
+the pane and the picture letterboxed itself *inside* a stage of the wrong
+shape.
+
+So mistake 5's invariant — the stage is exactly the rendered picture — was
+being violated everywhere, not just in the one capped case 5 fixed. Measured at
+1920×1080 as a guest: stage 1100×996 around a picture of 1100×619, putting
+subtitles ~190px below the frame. **0/15** viewport × file-ratio combinations
+had stage === picture.
+
+**Fix:** `width: min(1100px, 100%)` with `max-height: 100%` and no `height`.
+**Exactly one** axis definite — not zero, not two.
+
+Zero is its own bug, and I shipped it for one round before catching it: with
+maxima only, `main`'s `place-items: center` makes the stage shrink-to-fit, so
+it collapses to the *video's intrinsic size*. A 640x480 file then played at
+640x480 in the middle of a 1920x1080 window. A 1080p file looks roughly right
+that way, which is exactly why the first round of testing missed it — the
+fixture has to be the awkward ratio, not the common one.
+
+**What would have found it sooner:** the giveaway was in the measurements
+already — the numbers were *identical* with `--ar` set and with it absent. A
+variable that changes nothing when it changes is not being read. Measuring the
+control case alongside the real one costs nothing and makes "this rule is inert"
+obvious, where measuring only the real case just looks like a wrong number.
+
+**The general rule:** `aspect-ratio` needs exactly one free axis. Both definite
+and it is ignored; neither definite and a centring parent collapses the box to
+its content.
+
+### 5c. `place-items: center` cut the bottom off a 4:3 picture in fullscreen
+
+Part of the same report, found only by screenshotting the real thing. The
+fullscreen rule used `display: grid; place-items: center` on the stage. Centring
+makes the video shrink-to-fit its own content rather than honouring
+`height: 100%`, so a 4:3 file rendered **1920x1440 inside a 1080-tall screen** —
+360px of overflow, taking the bottom of the picture with it. Subtitles live at
+the bottom of the picture, so they were the part that got cut.
+
+`display: block` with the video at `100%/100%` and `object-fit: contain`
+letterboxes correctly at every ratio.
+
+**Note for next time:** the stage genuinely *is* the screen in fullscreen, not
+the picture — the UA stylesheet forces `width/height: 100%` with
+`max-width/max-height: none` at a precedence an id selector cannot beat. Trying
+to make the stage the picture there is wasted effort; I wrote a rule to do it
+and measured it having no effect at all. It does not matter, because jassub
+positions the canvas from the *video's* box and sets the canvas's own
+width/height/top/left — so subtitles track the picture regardless of what the
+offset parent is doing.
+
+**What found it:** a screenshot. The numbers had said "canvas === picture, 0.0px
+off" while the picture itself was hanging off the bottom of the screen — the
+measurement was self-consistent and still described a broken page. Rendering the
+thing and looking at it is the check that cannot be fooled this way.
+
+---
+
+## 7. A silently swallowed `.catch()` looked like "fullscreen doesn't work"
+
+**Reported as:** "why is full screen from media player not allowed? is it not
+possible at all?", then "you have to prompt the user since right now they just
+see that media player don't let them fullscreen".
+
+**Actually:** the native `<video>` fullscreen button *does* trigger fullscreen
+— briefly. The page's own `fullscreenchange` handler detects it, calls
+`exitFullscreen()`, and tries to promote `#stage` instead (subtitles have to
+ride along, and they can't attach to a fullscreen `<video>`; see the comment
+above this entry). That promotion request happened inside a `.then()`, not
+inside the original click — and browsers only grant `requestFullscreen()`
+inside the call stack of a real user gesture. Confirmed by direct test:
+`stageEl.requestFullscreen()` there throws `Permissions check failed`. So the
+promotion failed every time, silently, behind a bare `.catch(() => {})` — the
+viewer saw fullscreen engage for an instant and then drop back to the normal
+page, with nothing to tell them why or what to do instead.
+
+Also tried: swapping the fullscreen element directly without an intervening
+`exitFullscreen()` (some engines allow replacing the fullscreen element from a
+handler without a fresh gesture). Also refused, same error. **There is no
+programmatic way to make this promotion reliable** — the fix is a `notice()`
+in the `.catch()` pointing at the app's own fullscreen button, not a cleverer
+retry.
+
+**What would have found it sooner:** a bare `catch(() => {})` on anything
+user-initiated should be treated as a missing error path until proven
+otherwise, not a safe default. It was written that way from the start and
+never revisited because nothing *threw* during the sessions that built it —
+Chrome only refuses this on gestures that have already been spent, which a
+synthetic click-and-check misses unless it drives the *actual* native control,
+not a stand-in for it.
+
+---
+
 ## 6. A test that silently stopped testing
 
 `test/cpu.js` built its fixture by encoding 600s of 1080p HEVC within a 120s

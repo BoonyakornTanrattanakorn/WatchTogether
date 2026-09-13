@@ -614,12 +614,22 @@
      canvas and the autoplay gate are both positioned against it — a stage
      larger than the picture puts subtitles on the black bars, or past the
      bottom edge where the shell clips them. `--ar` is set from the video's
-     real dimensions on loadedmetadata. */
+     real dimensions on loadedmetadata.
+
+     Exactly one axis may be definite. `aspect-ratio` is ignored outright when
+     both width and height are definite, so `width: 100%; height: 100%` (which
+     this box used to carry) silently disables it. But `main` centres its items
+     rather than stretching them, so with *neither* axis definite the stage
+     shrinks to the video's intrinsic size instead — a 640x480 file then plays
+     at 640x480 in the middle of a 1920x1080 window.
+
+     So: width is definite, height comes from the ratio, and `max-height`
+     caps it in a short window. When that cap binds, the width follows the
+     ratio back down, because width is a percentage of the pane rather than a
+     fixed length. */
   #stage {
     position: relative;
-    width: 100%;
-    height: 100%;
-    max-width: 1100px;
+    width: min(1100px, 100%);
     max-height: 100%;
     aspect-ratio: var(--ar, 16 / 9);
     margin: auto;
@@ -719,9 +729,19 @@
      someone wants them most. So the stage is what goes fullscreen, and it
      carries the canvas and the autoplay gate with it.
 
-     Inside fullscreen the stage is the screen, so its max-width and the
-     centring margins have to come off, and the ratio still letterboxes the
-     picture within it. */
+     Fullscreen is the one place the stage is deliberately *not* the picture,
+     and it is the one place that is fine. The UA stylesheet sizes a
+     fullscreened element to the screen with `max-width/max-height: none` at a
+     precedence an id selector cannot beat, so the stage is the screen whatever
+     we write here; `aspect-ratio: auto` just makes that explicit rather than
+     fighting it. The picture letterboxes itself inside via `object-fit:
+     contain`, and the black bars are the stage's background.
+
+     Subtitles still land correctly because jassub does not use the stage: it
+     measures the *video's* box and sets the canvas's own width/height/top/left
+     from it, so the canvas tracks the picture even though its offset parent is
+     screen-sized. Verified with a real 4:3 file and a live libass renderer —
+     canvas and picture agreed to 0.0px, windowed and fullscreen. */
   #stage:fullscreen {
     width: 100%;
     height: 100%;
@@ -729,12 +749,16 @@
     max-height: none;
     aspect-ratio: auto;
     background: #000;
-    display: grid;
-    place-items: center;
+    /* Deliberately not a centring grid. `place-items: center` makes the video
+       shrink-to-fit its own 4:3 content instead of honouring height: 100%, so
+       a 4:3 file rendered 1920x1440 on a 1080-tall screen and the bottom of
+       the picture — where subtitles live — was cut off. Block layout with the
+       video at 100%/100% and `object-fit: contain` letterboxes correctly at
+       every ratio. */
+    display: block;
   }
   /* Re-letterbox inside the fullscreen box: the video keeps the file's shape
-     and the black bars are the stage's background. The canvas is positioned
-     against the stage and jassub measures the video, so both stay aligned. */
+     and the black bars are the stage's background. */
   #stage:fullscreen video {
     width: 100%;
     height: 100%;
@@ -1941,12 +1965,24 @@ addEventListener('resize', () => {
 // stays behind on the page and the viewer loses subtitles at the moment they
 // most want them. Catch that and promote the stage instead, which carries the
 // canvas and the gate with it.
+//
+// The promotion is not reliable. Browsers only grant requestFullscreen()
+// inside the call stack of a real user gesture, and by the time this handler
+// runs and calls exitFullscreen(), that gesture is spent — the follow-up
+// requestFullscreen() in the .then() is a plain async callback, not a click
+// handler, and engines are free to (and do) refuse it. When that happens the
+// page silently drops out of fullscreen entirely: no video, no stage, nothing
+// — which reads as "the fullscreen button doesn't work" with no clue why.
+// Previously this was swallowed by a bare `.catch(() => {})`; now it surfaces
+// as a notice so the viewer knows to use our button instead of guessing.
 document.addEventListener('fullscreenchange', () => {
   if (document.fullscreenElement === v) {
     dbg('native fullscreen on the video — promoting the stage so subtitles come too');
-    // Swapping elements means leaving fullscreen first; doing both in one tick
-    // is refused, so the request rides on the change event that follows.
-    document.exitFullscreen().then(() => stageEl.requestFullscreen?.()).catch(() => {});
+    document.exitFullscreen()
+      .then(() => stageEl.requestFullscreen?.())
+      .catch(() => {
+        notice('Your browser blocked that. Use the ⛶ button up top for fullscreen with subtitles.', 'drop');
+      });
     return;
   }
   if (jassub) jassub.resize().catch(() => {});

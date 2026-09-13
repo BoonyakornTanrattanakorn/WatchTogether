@@ -232,8 +232,8 @@ second, or it will read "not fetched yet" as "no subtitles".
 
 ## Layout
 
-**The stage is the picture.** `#stage` takes the space available and gives
-itself `aspect-ratio: var(--ar)`, set from `videoWidth`/`videoHeight` on
+**The stage is the picture.** `#stage` gives itself
+`aspect-ratio: var(--ar)`, set from `videoWidth`/`videoHeight` on
 `loadedmetadata`. Whichever of width or height binds first, the other follows,
 and the centring grid absorbs the remainder.
 
@@ -242,6 +242,30 @@ autoplay overlay are both positioned against `#stage`. **If the stage is ever
 larger than the rendered picture, subtitles are drawn on the letterbox or below
 the frame.** Any rule that resizes the video must resize the stage, not the
 video inside it.
+
+**The stage gets exactly one definite axis** — `width: min(1100px, 100%)`,
+`max-height: 100%`, and no `height`. This is not stylistic. `aspect-ratio` is
+ignored when both axes are definite, and `main` centres its items rather than
+stretching them, so with neither axis definite the stage collapses to the
+video's intrinsic size. Both failures were shipped and reverted; see mistake 5b.
+
+**Fullscreen is the exception: there the stage is the screen, not the picture.**
+The UA stylesheet forces `width`/`height: 100%` with `max-width`/`max-height:
+none` on a fullscreened element, at a precedence an id selector cannot beat — so
+this is not a choice. `#stage:fullscreen` states it explicitly with
+`aspect-ratio: auto`, and the video letterboxes itself inside via `object-fit:
+contain` against the stage's black background. Use `display: block`, **not** a
+centring grid: `place-items: center` makes the video shrink-to-fit its own
+content instead of honouring `height: 100%`, which overflows a 4:3 picture off
+the bottom of a 16:9 screen (mistake 5c).
+
+Subtitles survive that exception because jassub never looks at the stage: it
+measures the *video's* box and sets the canvas's own width, height, top and left
+from it. Verified with a real 4:3 file and a live libass renderer — canvas and
+picture agreed to 0.0px windowed and fullscreen, confirmed by screenshot.
+
+**Test layout changes with a 4:3 fixture, not a 16:9 one.** In 16:9 the video's
+box and its picture coincide, which hides every bug in this section.
 
 **The page never scrolls, at any size or role.** `body` is a hard `100dvh` with
 `overflow: hidden`, and every list that can grow scrolls inside its own pane.
@@ -253,6 +277,20 @@ fullscreen button takes the video element alone, and the subtitle canvas is a
 sibling of it — so it stays behind on the page and subtitles vanish exactly when
 someone most wants them. `fullscreenchange` catches that and promotes the stage;
 Safari's element-only fullscreen is caught via `webkitbeginfullscreen`.
+
+**The promotion can silently fail, and there is no fix for that — only a
+notice.** `requestFullscreen()` only succeeds inside the call stack of a real
+user gesture. By the time `fullscreenchange` fires and calls
+`exitFullscreen()`, that gesture is spent; the follow-up
+`stageEl.requestFullscreen()` in the `.then()` is a plain async callback and
+Chrome refuses it (`Permissions check failed`, confirmed by direct test — also
+tried requesting the stage *without* an intervening exit, i.e. swapping the
+fullscreen element directly; refused with the same error). When it's refused,
+the whole page silently drops out of fullscreen — no video, no stage — which
+reads as "the fullscreen button doesn't work" with no clue why. The `.catch()`
+now shows a notice pointing at the app's own fullscreen button instead of
+swallowing the failure. There is no way to make the native button's promotion
+reliable; the notice is the fix.
 
 Viewers and hosts both get the header. Viewers lose only the sidebar, which is
 removed from the layout rather than hidden so the grid collapses to one column.
