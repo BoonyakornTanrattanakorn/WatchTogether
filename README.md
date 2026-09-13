@@ -80,6 +80,34 @@ environment variables override it, so a systemd unit or a one-off
 On Windows, quote UNC paths — PowerShell's `Start-Process -ArgumentList`
 splits on spaces unless the argument is quoted.
 
+### Docker
+
+A `Dockerfile` and `docker-compose.yaml` are included. The compose file
+expects an image reference rather than building in place, so a deploy tool
+that only takes a compose file (no repo access) can still pull it.
+
+Build and push it to a registry of your choice:
+
+```bash
+docker build -t <registry>/<owner>/watch-together:latest .
+docker login <registry> -u <owner>
+docker push <registry>/<owner>/watch-together:latest
+```
+
+`<registry>` is `docker.io` (Docker Hub) or `ghcr.io` (GitHub Container
+Registry), for example. Update the `image:` line in `docker-compose.yaml` to
+match what you pushed.
+
+On GHCR, a newly pushed package defaults to **private** — a puller without
+credentials gets `unauthorized`. Either make the package public (its GitHub
+Packages settings → Change visibility) or `docker login` on the machine
+that's pulling it, using a token with `read:packages`.
+
+The container reads the same variables as above, set as real environment
+variables (`environment:` in the compose file) rather than a `.env` file —
+see the comments in `docker-compose.yaml` and `.env.example` for what to
+set, in particular `MEDIA_DIRS`/the media bind mount and `DATA_DIR`.
+
 ## Accounts
 
 Two roles. **Admin** controls playback, picks files, and approves users.
@@ -176,19 +204,27 @@ The controls sit above the tabs — **Play this for everyone**, the `audio` and
 `subs` selectors, and **Accounts** — so a long file list can never push them
 off the screen.
 
-**Library** — a searchable list grouped by folder. Type to filter, click to
-select, then **Play this for everyone** (or double-click to play straight
-away). Your play, pause and seek drive every viewer.
+**Library** — browse folders like a file manager: only the current folder's
+subfolders and files are listed, each subfolder showing how many files it
+holds. Click a folder to open it, and the breadcrumb above the list to jump
+back to any ancestor (or to the library root). Click a file to select it,
+then **Play this for everyone** (or double-click to play straight away). Your
+play, pause and seek drive every viewer. Typing a search stays scoped to the
+folder you're in — it filters the subfolders and files already on screen by
+name, rather than searching the whole library, so it stays useful with a
+hundred-plus folders at one level. Admins see an inline **encode** button on
+any row that needs converting; a row mid-conversion shows its percent there
+too. Below the list, an **Encoding** strip (collapsed unless something needs
+attention) holds everything that doesn't fit on a single row: active and
+queued jobs with progress and cancel, disk usage, orphaned conversions to
+delete, and **Encode current** to queue whatever is playing right now without
+hunting for it. See [Encoding](#encoding-from-the-library-panel).
 
 **People** — everyone connected, with a coloured dot for how they're doing:
 `synced`, `buffering`, `behind 3.2s`, or `high latency`, plus their round-trip
 time. Latency and drift are self-reported by each viewer's browser, so treat
 them as a diagnostic rather than a guarantee. This is where you look when
 someone says the video is stuttering.
-
-**Encode** — files a browser cannot decode, and what to do about them. Queue
-one, watch it convert, play it when it says `ready`. Admin-only; see
-[Encoding](#encoding-from-the-encode-panel).
 
 **Stats** — machine CPU, this app's CPU, upload and disk-read throughput,
 uptime and memory. **Admin-only**: viewers get the People tab but never see the
@@ -269,8 +305,8 @@ server.js    HTTP + WebSocket server. Library index, range serving, room state,
 db.js        SQLite: users, invites, settings. No dependency — node:sqlite.
 auth.js      Session cookies and the per-IP rate limiter.
 pages.js     Server-rendered login / register / setup pages.
-watch.html   The player, sidebar, encode panel and accounts panel. No build
-             step.
+watch.html   The player, sidebar (library, encode strip, people, stats, log)
+             and accounts panel. No build step.
 test/        Plain-node tests: the access-gate matrix, account management,
              room behaviour, request-body decoding, and encoder lifetime.
              `npm test`.
@@ -326,10 +362,14 @@ the ffprobe data it was already collecting:
 Without ffprobe the verdict is always `ok: true` — claiming nothing beats
 warning wrongly.
 
-### Encoding, from the Encode panel
+### Encoding, from the Library panel
 
-Unplayable files are converted ahead of time. The host opens **Encode** in the
-sidebar, queues what they want, and plays it once it is ready.
+Unplayable files are converted ahead of time, not during playback. The host
+queues a file with the **encode** button on its row in the Library list, and
+plays it once it is ready. The **Encoding** strip at the bottom of the
+Library panel holds everything a single row can't: active and queued jobs
+with progress, disk usage, and orphaned conversions — it opens itself
+whenever there is something to look at.
 
 This used to happen during playback: asking for an unplayable file started an
 ffmpeg pipe and the viewer watched the output live. It worked, and it was the
@@ -340,7 +380,7 @@ substitute clock, and a subtitle time offset, and two encoders ran at once on a
 machine that was also serving video. All of that has gone. `GET /transcode/<id>`
 now serves a finished file or answers `409`; it never starts an encoder.
 
-The panel lists every file the probe says a browser cannot decode, with the
+The strip lists every file the probe says a browser cannot decode, with the
 reason, plus anything queued and anything already converted:
 
 | State | What it means |
@@ -355,7 +395,7 @@ Progress comes from ffmpeg's `-progress` stream rather than by parsing its
 human-readable stderr, which changes wording between releases.
 
 **Clear finished** empties the finished and failed rows. It does not delete
-anything — the converted files stay on disk, and the panel goes on listing them
+anything — the converted files stay on disk, and the strip goes on listing them
 as ready.
 
 ### What it costs while it runs

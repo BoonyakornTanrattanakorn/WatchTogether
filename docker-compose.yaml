@@ -1,6 +1,6 @@
 services:
   watch-together:
-    build: .
+    image: ghcr.io/boonyakorntanrattanakorn/watch-together:latest
     restart: unless-stopped
     ports:
       - "8090:8090"
@@ -8,11 +8,13 @@ services:
       - MEDIA_DIRS=/media
       - PORT=8090
       - DATA_DIR=/data
+      - CACHE_DIR=/cache
       - RECURSIVE=${RECURSIVE:-0}
       - SETUP_TOKEN=${SETUP_TOKEN:-}
-      - TRANSCODE_CACHE_GB=${TRANSCODE_CACHE_GB:-20}
+      - TRANSCODE_CACHE_GB=${TRANSCODE_CACHE_GB:-2}
       - TRANSCODE_THREADS=${TRANSCODE_THREADS:-}
       - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-1}
     volumes:
       - ./data:/data
       - ${MEDIA_PATH}:/media:ro
+      - ${CACHE_PATH:-./data/transcoded}:/cache

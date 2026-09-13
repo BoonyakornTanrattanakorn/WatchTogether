@@ -204,6 +204,37 @@
     font-size: 0.8rem;
   }
   #filter { width: 100%; box-sizing: border-box; }
+  #encodeCurrent { width: 100%; box-sizing: border-box; margin-top: 0.5rem; }
+  .lib-head { display: flex; gap: 0.5rem; }
+  .lib-head #filter { flex: 1; min-width: 0; }
+
+  /* --- breadcrumb -----------------------------------------------------------
+     Where you are while drilled into a subfolder. Hidden at the library root
+     and while a search is active, since search results are not scoped to a
+     folder. */
+  #crumbs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25em;
+    padding: 0 0.75rem 0.5rem;
+    font-size: 0.78rem;
+    color: var(--dim);
+  }
+  #crumbs:empty { display: none; }
+  #crumbs button {
+    background: none;
+    border: none;
+    padding: 0.1em 0.2em;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+    text-align: left;
+  }
+  #crumbs button:hover, #crumbs button:focus-visible { color: var(--text); }
+  #crumbs .sep { opacity: 0.5; }
+  #crumbs .here { color: var(--text); overflow-wrap: anywhere; }
 
   /* --- library list --------------------------------------------------------
      A list, not a <select>: it can wrap, show the folder, and be searched. */
@@ -215,33 +246,40 @@
     padding: 0;
     list-style: none;
   }
-  /* A deep path can be longer than the column is wide. Clamp it to one line
-     and show the tail, which is the part that identifies the folder — the
-     full path is on the title attribute. */
-  #fileList .dir {
-    position: sticky;
-    top: 0;
-    padding: 0.35rem 0.75rem;
-    background: var(--panel);
-    color: var(--dim);
-    font-size: 0.72rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    border-bottom: 1px solid var(--line);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    direction: rtl;          /* ellipsis at the start, so the leaf stays */
-    text-align: left;
+  #fileList .folder {
+    padding: 0.45rem 0.75rem;
+    font-size: 0.88rem;
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    color: var(--text);
   }
-  #fileList .dir span { direction: ltr; unicode-bidi: embed; }
+  #fileList .folder .icon { flex: none; opacity: 0.7; }
+  #fileList .folder .folder-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #fileList .folder .folder-count { flex: none; color: var(--dim); font-size: 0.78rem; }
+  #fileList .folder:hover { background: var(--ink); }
+  #fileList .folder:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
   #fileList .file {
     padding: 0.45rem 0.75rem;
     font-size: 0.88rem;
     cursor: pointer;
     border-left: 2px solid transparent;
-    overflow-wrap: anywhere;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5em;
   }
+  #fileList .file-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #fileList .file-enc { flex: none; }
+  #fileList .enc-inline {
+    padding: 0.15rem 0.5rem;
+    font-size: 0.72rem;
+    border-radius: 3px;
+  }
+  #fileList .enc-inline.busy { color: var(--signal); border-color: var(--signal); }
+  #fileList .enc-inline.bad { color: #e06c62; border-color: #e06c62; }
   #fileList .file:hover { background: var(--ink); }
   #fileList .file.on {
     background: var(--ink);
@@ -251,11 +289,39 @@
   #fileList .file:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
   body.guest #fileList .file { cursor: default; }
 
-  /* --- encode queue --------------------------------------------------------
-     One row per file that needs converting, whatever state it is in: nothing
-     yet, waiting, running, done, failed. Kept in one list rather than split
-     into sections so a file does not jump around the panel as it progresses —
-     the row stays put and its right-hand side changes. */
+  /* --- encode strip ---------------------------------------------------------
+     Folded into the bottom of the Library panel rather than its own tab: a
+     fixed-height block (not flex: 1, unlike the file list above it) so it
+     takes a bounded amount of room instead of competing with the file list
+     for space. One row per file that needs converting, whatever state it is
+     in: nothing yet, waiting, running, done, failed. Kept in one list rather
+     than split into sections so a file does not jump around as it
+     progresses — the row stays put and its right-hand side changes. */
+  #encodeBox {
+    flex: none;
+    border-top: 1px solid var(--line);
+    max-height: 45%;
+    display: flex;
+    flex-direction: column;
+  }
+  #encodeBox[open] { min-height: 0; }
+  #encodeSummary {
+    cursor: pointer;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8rem;
+    color: var(--dim);
+    list-style: none;
+  }
+  #encodeSummary::-webkit-details-marker { display: none; }
+  #encodeSummary:hover { color: var(--text); }
+  #encodeSummary .dot {
+    display: inline-block;
+    width: 0.5em;
+    height: 0.5em;
+    border-radius: 50%;
+    background: var(--signal);
+    margin-right: 0.4em;
+  }
   #encodeList {
     flex: 1;
     min-height: 0;
@@ -835,39 +901,43 @@
       <button type="button" class="tab" data-panel="peoplePanel">
         People<span class="count" id="peopleCount">0</span>
       </button>
-      <button type="button" class="tab admin-only" data-panel="encodePanel">
-        Encode<span class="count" id="encodeCount" hidden>0</span>
-      </button>
       <button type="button" class="tab" data-panel="statsPanel">Stats</button>
       <button type="button" class="tab admin-only" data-panel="logPanel">Log</button>
     </nav>
 
     <section id="libraryPanel" class="panel">
-      <div class="pad">
+      <div class="pad lib-head">
         <input id="filter" type="search" placeholder="Search the library…" autocomplete="off">
       </div>
+      <nav id="crumbs" aria-label="Current folder"></nav>
       <ul id="fileList"></ul>
       <p class="note" id="fileNote"></p>
+
+      <!-- What used to be a separate Encode tab, folded in here: converting a
+           file the browser cannot decode is something the host asks for ahead
+           of time. Per-file "encode"/"retry"/progress lives inline on each
+           Library row above; this strip is only for what a row in a different
+           folder cannot show — active/queued jobs, disk usage, and orphaned
+           conversions. Collapsed to one summary line when there is nothing to
+           act on. -->
+      <details id="encodeBox" class="admin-only">
+        <summary id="encodeSummary">Encoding</summary>
+        <div class="pad">
+          <button id="encodeCurrent" type="button" hidden>Encode current</button>
+          <p class="note" id="encodeNote">Checking the library…</p>
+          <p id="encodeErr" class="encode-err" hidden></p>
+        </div>
+        <ul id="encodeList"></ul>
+        <div class="pad encode-foot">
+          <span id="encodeDisk" class="note"></span>
+          <button id="encodeClear" type="button" hidden>Clear finished</button>
+        </div>
+      </details>
     </section>
 
     <section id="peoplePanel" class="panel" hidden>
       <ul id="peopleList"></ul>
       <p class="note" id="peopleNote"></p>
-    </section>
-
-    <!-- Files a browser cannot decode are converted here, ahead of time,
-         rather than during playback. The list is everything in the library
-         that needs it, plus whatever is queued or already done. -->
-    <section id="encodePanel" class="panel" hidden>
-      <div class="pad">
-        <p class="note" id="encodeNote">Checking the library…</p>
-        <p id="encodeErr" class="encode-err" hidden></p>
-      </div>
-      <ul id="encodeList"></ul>
-      <div class="pad encode-foot">
-        <span id="encodeDisk" class="note"></span>
-        <button id="encodeClear" type="button" hidden>Clear finished</button>
-      </div>
     </section>
 
     <section id="statsPanel" class="panel" hidden>
@@ -1136,6 +1206,7 @@ function connect() {
     if (msg.type === 'encode:error') {
       encodeErr.textContent = msg.error;
       encodeErr.hidden = false;
+      encodeBox.open = true; // otherwise a collapsed strip hides the error entirely
       clearTimeout(encodeErrTimer);
       encodeErrTimer = setTimeout(() => { encodeErr.hidden = true; }, 6000);
       return;
@@ -1159,7 +1230,9 @@ function connect() {
   };
 }
 
+let encodeInitialized = false;
 function setRole(host) {
+  const becameHost = host && !isHost;
   isHost = host;
   document.body.classList.toggle('guest', !host);
   // Both classes exist so layout rules can target either without relying on
@@ -1168,6 +1241,15 @@ function setRole(host) {
   roleEl.textContent = host ? 'you control playback' : 'the host controls playback';
   // Guests keep volume, fullscreen and captions; they just can't drive.
   v.controlsList = host ? '' : 'nodownload noplaybackrate';
+  // The encode strip now lives inline in the Library panel rather than its
+  // own tab, so what used to run when that tab was opened now runs once as
+  // soon as we know we are host — the per-row badges need it immediately,
+  // not only once someone expands the strip.
+  if (becameHost && !encodeInitialized) {
+    encodeInitialized = true;
+    send('encode:state');
+    probeLibrary();
+  }
 }
 
 // --- clock -------------------------------------------------------------------
@@ -1401,6 +1483,7 @@ async function apply(msg) {
     nowEl.title = msg.label || '';
     v.querySelectorAll('track').forEach((t) => t.remove());
     destroyJassub();
+    renderEncode();
     dbg(`loading ${msg.label} (${msg.src})`);
     loadTracks(msg.src);
   }
@@ -1530,7 +1613,7 @@ function useEncoded(id, reasons) {
   hintEl.textContent = 'not converted yet';
   hintEl.className = 'holding';
   if (isHost) {
-    notice(`${why}. Queue it in the Encode tab, then play it again.`, 'drop');
+    notice(`${why}. Queue it in the Library list, then play it again.`, 'drop');
   } else {
     notice('This file has not been converted for the browser yet — ask the host.', 'drop');
   }
@@ -2350,14 +2433,6 @@ for (const tab of document.querySelectorAll('#tabs .tab')) {
     // The log is only fetched when someone looks at it; there is no point
     // streaming history to a panel nobody has open.
     if (tab.dataset.panel === 'logPanel') send('admin:log');
-    // Same reasoning for the encode panel, and more so: working out which
-    // files need converting means an ffprobe per file, which is not worth
-    // spending on a panel that may never be opened.
-    if (tab.dataset.panel === 'encodePanel') {
-      send('encode:state');
-      renderEncode();
-      probeLibrary();
-    }
   };
 }
 
@@ -2471,7 +2546,6 @@ const encodeNote = document.getElementById('encodeNote');
 const encodeErr = document.getElementById('encodeErr');
 const encodeDisk = document.getElementById('encodeDisk');
 const encodeClear = document.getElementById('encodeClear');
-const encodeCount = document.getElementById('encodeCount');
 
 let encodeData = { available: true, items: [], usedBytes: 0, limitGb: 0 };
 let encodeErrTimer = null;
@@ -2568,15 +2642,27 @@ function encodeRows() {
   );
 }
 
+const encodeCurrentBtn = document.getElementById('encodeCurrent');
+const encodeBox = document.getElementById('encodeBox');
+const encodeSummary = document.getElementById('encodeSummary');
+
 function renderEncode() {
   if (!isHost) return;
   const rows = encodeRows();
-
-  // The tab badge counts outstanding work, not the whole list: a done row is
-  // not something anyone needs to come back to.
   const busy = rows.filter((r) => r.status === 'encoding' || r.status === 'queued').length;
-  encodeCount.textContent = String(busy);
-  encodeCount.hidden = busy === 0;
+
+  // Collapsed by default; opens itself the first time there is something
+  // worth looking at, same as the tab badge used to draw the eye.
+  if (busy && !encodeBox.open && !encodeBox.dataset.userToggled) encodeBox.open = true;
+  encodeSummary.innerHTML = '';
+  if (busy) {
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    encodeSummary.appendChild(dot);
+  }
+  encodeSummary.appendChild(
+    document.createTextNode(busy ? `Encoding — ${busy} file${busy === 1 ? '' : 's'} to go` : 'Encoding')
+  );
 
   encodeListEl.replaceChildren();
 
@@ -2697,9 +2783,36 @@ function renderEncode() {
     ? `${fmtBytes(encodeData.usedBytes)} of ${encodeData.limitGb} GB used`
     : '';
   encodeClear.hidden = !rows.some((r) => r.status === 'done' || r.status === 'failed');
+
+  // Offered only once we positively know the playing file needs converting
+  // and isn't already queued or done — a shortcut so the host does not have
+  // to navigate there in the file list just to click the same button.
+  const currentId = state?.src;
+  const currentRow = currentId ? rows.find((r) => r.id === currentId) : null;
+  const currentNeedsAction = currentRow && (currentRow.status === 'none' || currentRow.status === 'failed');
+  encodeCurrentBtn.hidden = !currentId || !currentNeedsAction || !encodeData.available;
+  if (currentNeedsAction) {
+    encodeCurrentBtn.textContent =
+      currentRow.status === 'failed' ? 'Retry current' : 'Encode current';
+    encodeCurrentBtn.title = currentRow.label || '';
+  }
+
+  // The Library tab shows its own per-file encode badge, sourced from the
+  // same rows — keep it in step whenever the queue or a probe result changes.
+  renderLibrary();
 }
 
 encodeClear.onclick = () => send('encode:clear');
+encodeCurrentBtn.onclick = () => {
+  if (state?.src) send('encode:queue', { id: state.src });
+};
+// Once someone has clicked the summary themselves, stop auto-opening the
+// strip on their behalf — they have shown they want to control it. A click
+// on the summary is the only way to toggle a <details>, so this cannot
+// confuse a user action with the programmatic open in renderEncode above.
+encodeSummary.addEventListener('click', () => {
+  encodeBox.dataset.userToggled = '1';
+});
 
 // --- library -----------------------------------------------------------------
 // A filtered list rather than a <select>: a select cannot wrap, ellipsize or be
@@ -2711,35 +2824,119 @@ const fileListEl = document.getElementById('fileList');
 const fileNote = document.getElementById('fileNote');
 const pickedName = document.getElementById('pickedName');
 const loadBtn = document.getElementById('load');
+const crumbsEl = document.getElementById('crumbs');
 
 let library = [];
 let picked = null;
 
+// The folder currently drilled into, as path segments (e.g. ['Show',
+// 'Season 1']). '' is the library root. Not persisted — each visit starts
+// back at the root, same as opening a real file browser fresh.
+let currentDir = [];
+
+// One button on the Library row itself for files that need converting,
+// failed, or are mid-conversion. Ready/not-yet-probed files show nothing
+// extra; the Encoding strip below the list remains the place to see the
+// whole queue, disk usage and orphans at once.
+function encodeBadge(row) {
+  const wrap = document.createElement('span');
+  wrap.className = 'file-enc';
+  wrap.onclick = (e) => e.stopPropagation(); // do not also select the row
+
+  const button = (label, cls, fn) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'enc-inline' + (cls ? ' ' + cls : '');
+    b.textContent = label;
+    b.onclick = fn;
+    return b;
+  };
+
+  if (row.status === 'encoding') {
+    wrap.appendChild(button(`${row.percent.toFixed(0)}%`, 'busy', () => send('encode:cancel', { id: row.id })));
+  } else if (row.status === 'queued') {
+    wrap.appendChild(button('waiting', 'busy', () => send('encode:cancel', { id: row.id })));
+  } else if (row.status === 'failed') {
+    wrap.appendChild(button('retry', 'bad', () => send('encode:queue', { id: row.id })));
+  } else if (row.status === 'none') {
+    wrap.appendChild(button('encode', '', () => send('encode:queue', { id: row.id })));
+  }
+  return wrap;
+}
+
+// f.dir is a full path like "Show/Season 1"; '' means the library root.
+function dirSegments(dir) {
+  return dir ? dir.split('/') : [];
+}
+
+function renderCrumbs() {
+  crumbsEl.replaceChildren();
+  // Search is scoped to the current folder, so the breadcrumb stays visible
+  // (and clickable) while one is active — it shows what the search is
+  // actually searching within, and clicking an ancestor still works to widen
+  // or narrow scope before or during a search.
+  if (!currentDir.length) return;
+
+  const root = document.createElement('button');
+  root.type = 'button';
+  root.textContent = 'Library';
+  root.onclick = () => {
+    currentDir = [];
+    renderLibrary();
+  };
+  crumbsEl.appendChild(root);
+
+  currentDir.forEach((seg, i) => {
+    const sep = document.createElement('span');
+    sep.className = 'sep';
+    sep.textContent = '/';
+    crumbsEl.appendChild(sep);
+
+    if (i === currentDir.length - 1) {
+      const here = document.createElement('span');
+      here.className = 'here';
+      here.textContent = seg;
+      crumbsEl.appendChild(here);
+    } else {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = seg;
+      b.onclick = () => {
+        currentDir = currentDir.slice(0, i + 1);
+        renderLibrary();
+      };
+      crumbsEl.appendChild(b);
+    }
+  });
+}
+
 function renderLibrary() {
   const q = filterEl.value.trim().toLowerCase();
-  // Match against the full label so a folder name finds everything under it.
-  const hits = q ? library.filter((f) => f.label.toLowerCase().includes(q)) : library;
+  const encodeRowsById = isHost ? new Map(encodeRows().map((r) => [r.id, r])) : null;
 
+  filterEl.placeholder = currentDir.length
+    ? `Search in ${currentDir[currentDir.length - 1]}…`
+    : 'Search the library…';
+
+  renderCrumbs();
   fileListEl.replaceChildren();
-  let lastDir = null;
-  for (const f of hits.slice(0, 400)) {
-    if (f.dir !== lastDir) {
-      lastDir = f.dir;
-      const li = document.createElement('li');
-      li.className = 'dir';
-      li.title = f.dir || 'library root';
-      // Wrapped in a span so the rtl trick on the parent clips the head of the
-      // path rather than reversing the text itself.
-      const inner = document.createElement('span');
-      inner.textContent = f.dir || 'library root';
-      li.appendChild(inner);
-      fileListEl.appendChild(li);
-    }
+
+  const addFileRow = (f) => {
     const li = document.createElement('li');
     li.className = 'file' + (picked === f.id ? ' on' : '');
     li.tabIndex = 0;
     li.title = f.label;
-    li.textContent = f.name;
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'file-name';
+    nameEl.textContent = f.name;
+    li.appendChild(nameEl);
+
+    if (isHost) {
+      const enc = encodeRowsById.get(f.id);
+      if (enc) li.appendChild(encodeBadge(enc));
+    }
+
     const choose = () => {
       picked = f.id;
       pickedName.textContent = f.name;
@@ -2761,12 +2958,88 @@ function renderLibrary() {
       if (isHost) send('load', { src: f.id });
     };
     fileListEl.appendChild(li);
+  };
+
+  // Only what is directly inside currentDir — immediate subfolders, then
+  // files that live right here, each sorted by name. A subfolder someone
+  // hasn't opened yet is not built into the DOM at all, which is what keeps
+  // this fast over a deep, wide tree.
+  const prefix = currentDir.join('/');
+  const subfolders = new Map(); // segment -> file count under it (recursive)
+  const filesHere = [];
+  for (const f of library) {
+    const segs = dirSegments(f.dir);
+    if (prefix && !(f.dir === prefix || f.dir.startsWith(prefix + '/'))) continue;
+    const rest = segs.slice(currentDir.length);
+    if (rest.length === 0) {
+      filesHere.push(f);
+    } else {
+      subfolders.set(rest[0], (subfolders.get(rest[0]) || 0) + 1);
+    }
   }
 
+  // The search box filters only what is already on screen — the subfolders
+  // and files directly in this folder — by name. It does not widen to the
+  // whole library or recurse into subfolders: with 100+ folders at one
+  // level, that is the whole point, and a match many levels down would be
+  // useless without also showing the path to reach it.
+  let sortedFolders = [...subfolders.keys()].sort((a, b) => a.localeCompare(b));
+  let visibleFiles = filesHere;
+  if (q) {
+    sortedFolders = sortedFolders.filter((name) => name.toLowerCase().includes(q));
+    visibleFiles = filesHere.filter((f) => f.name.toLowerCase().includes(q));
+  }
+
+  for (const name of sortedFolders) {
+    const li = document.createElement('li');
+    li.className = 'folder';
+    li.tabIndex = 0;
+    li.title = name;
+
+    const icon = document.createElement('span');
+    icon.className = 'icon';
+    icon.textContent = '📁';
+    li.appendChild(icon);
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'folder-name';
+    nameEl.textContent = name;
+    li.appendChild(nameEl);
+
+    const count = document.createElement('span');
+    count.className = 'folder-count';
+    const n = subfolders.get(name);
+    count.textContent = `${n} file${n === 1 ? '' : 's'}`;
+    li.appendChild(count);
+
+    const open = () => {
+      currentDir = [...currentDir, name];
+      renderLibrary();
+    };
+    li.onclick = open;
+    li.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open();
+      }
+    };
+    fileListEl.appendChild(li);
+  }
+
+  visibleFiles.sort((a, b) => a.name.localeCompare(b.name));
+  for (const f of visibleFiles) addFileRow(f);
+
   if (!library.length) fileNote.textContent = 'Nothing found in the scanned paths.';
-  else if (!hits.length) fileNote.textContent = `No file matches "${filterEl.value.trim()}".`;
-  else if (hits.length > 400) fileNote.textContent = `Showing 400 of ${hits.length} — keep typing.`;
-  else fileNote.textContent = `${hits.length} file${hits.length === 1 ? '' : 's'}`;
+  else if (q && !sortedFolders.length && !visibleFiles.length) {
+    fileNote.textContent = `Nothing here matches "${filterEl.value.trim()}".`;
+  } else if (!subfolders.size && !filesHere.length) {
+    fileNote.textContent = 'This folder is empty.';
+  } else {
+    const parts = [];
+    if (sortedFolders.length) parts.push(`${sortedFolders.length} folder${sortedFolders.length === 1 ? '' : 's'}`);
+    if (visibleFiles.length) parts.push(`${visibleFiles.length} file${visibleFiles.length === 1 ? '' : 's'}`);
+    fileNote.textContent = parts.join(', ') || 'Nothing here matches your search.';
+  }
 }
 
 filterEl.oninput = renderLibrary;

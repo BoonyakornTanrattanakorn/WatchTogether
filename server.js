@@ -258,8 +258,10 @@ function walk(dir, base, depth, out, rootIndex) {
       if (recursive) walk(full, base, depth + 1, out, rootIndex);
     } else if (VIDEO[path.extname(e.name).toLowerCase()]) {
       // `label` is already the path relative to this root, which is exactly
-      // what the id should be derived from.
-      const label = path.relative(base, full);
+      // what the id should be derived from. Normalised to '/' so it reads the
+      // same regardless of platform, and so the client can split it into
+      // folder segments without caring what OS indexed it.
+      const label = path.relative(base, full).split(path.sep).join('/');
       out.set(idFor(rootIndex, label), {
         file: full,
         label,
