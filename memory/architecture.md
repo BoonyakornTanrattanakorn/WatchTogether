@@ -118,12 +118,29 @@ seeks anybody unless they are badly out.**
 
   | drift | action |
   |---|---|
-  | < 0.15s (`NUDGE`) | leave alone |
-  | 0.15s – 2.5s | lean on `playbackRate`, scaled with the error, capped ±12% |
+  | < 0.05s (`NUDGE`) | leave alone |
+  | 0.05s – 2.5s | lean on `playbackRate`, scaled with the error (floor 2%, cap 12%) |
   | > 2.5s (`HARD_SEEK`) | seek |
 
   Both thresholds are defined adjacent to each other in `watch.html`
   deliberately, because a gap between them once stranded viewers permanently.
+
+  `NUDGE` is not just "don't bother" — it is the drift the room settles at,
+  because correction only engages past it and a host's own `playbackRate` is
+  never exactly 1.000. The loop runs every 250ms, not 1000ms, so a real
+  disturbance (a throttled tab, a stall) is caught within one tick rather than
+  travelling most of the way back out of band first. Verified end-to-end with
+  two real browsers against the real server: untouched, drift holds at 1-3ms;
+  recovering from a forced ~700ms gap, it's back under 100ms in about 15s and
+  settles at ~47ms indefinitely.
+
+  **Pausing is the one moment held to zero, not to `NUDGE`.** A paused seek
+  causes no stutter to worry about, so `apply()` always seeks a viewer to the
+  host's exact reported position on pause — no dead zone at all. Measured: a
+  viewer forced 150ms-1.2s out of position lands within 1ms of the host's
+  frame the instant the host pauses. The old code only corrected pause gaps
+  over 250ms, so anything smaller was left uncorrected indefinitely — exactly
+  backwards for the moment where correcting is free.
 
 - The **clock offset** is not a single sample. Eight ping/pong samples are kept
   and the one with the **lowest round trip** wins — latency is only ever added
@@ -131,6 +148,49 @@ seeks anybody unless they are badly out.**
   contaminated. A fresh connection measures five times in two seconds, then
   every five seconds (which doubles as the tunnel keepalive). Correction refuses
   to act until the clock has been measured at least once.
+
+- **A resume is scheduled, not applied immediately — this is what makes
+  "click play" land at the same instant for everyone, host included.**
+  Applying a resume the moment the `control` message is received staggers
+  everyone's actual start by however long their own leg of the broadcast
+  happened to take, and the host's own leg (click → `v.play()` resolving) is
+  no exception — a host who un-pauses their own player is not a reference
+  point here, they are just the first person whose trip finished.
+
+  So the server does not flip `room.paused` to `false` on a resume. It picks
+  `playAt = Date.now() + PLAY_LEAD_MS` (700ms), broadcasts an ordinary-looking
+  paused state at the target position with `playAt` riding along, and only
+  flips to actually playing — with a second broadcast — once a server-side
+  timer confirms `playAt` has passed and nothing cancelled it. Every client
+  (including the host) translates `playAt` through the same clock `offset`
+  the drift loop already trusts and schedules its own local `v.play()` for
+  that instant — so nobody is waiting on a second network round trip to
+  start, they are all counting down independently against the same instant.
+  700ms is comfortably above the "high latency" threshold the client already
+  warns about for its own RTT (400ms).
+
+  A resume is the only `control` transition scheduled this way — pausing and
+  seeking-while-playing still apply at once, because there is nothing to
+  schedule *to* for a pause, and scheduling a seek would just make scrubbing
+  feel laggy for no syncing benefit the drift loop doesn't already provide.
+
+  **The host's own play button can't be intercepted before it fires** — it's
+  native browser chrome. What can be caught is the resulting `play` event:
+  `control()` immediately pauses straight back before the frame advances, so
+  the host's own video also waits out the lead time rather than getting a
+  head start. That re-entrant `v.pause()` call itself fires a `pause` event —
+  asynchronously, not in the same tick, confirmed by tracing — so suppressing
+  the spurious second `control` message it would otherwise send needs a flag
+  cleared on a short timer, not cleared right after the call. See mistake 9
+  for why this one was hard to catch: the two messages both really do reach
+  the server, in order, and the second really does cancel the schedule the
+  first one just created.
+
+  Verified with two real browsers and a real gesture on the host's play
+  button (not `v.play()` called from test code): host and viewer start
+  playing within 1-3ms of each other, repeatably. Cancelling mid-countdown
+  (pausing again before `playAt` fires) was verified to leave the room
+  paused, never having started.
 
 ### The echo guard
 

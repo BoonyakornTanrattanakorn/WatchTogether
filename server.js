@@ -1820,6 +1820,24 @@ function notifyAdmins(msg) {
   }
 }
 
+// A resume is scheduled this far in the future (server clock) rather than
+// applied immediately, so every client — host included — starts playback at
+// the same instant instead of whenever their own "play" message happens to
+// arrive. See the 'control' case below for why. Comfortably above the "high
+// latency" threshold the client already warns about for its own clock RTT
+// (400ms), so a normal connection has margin to spare.
+const PLAY_LEAD_MS = 700;
+
+// A pending scheduled play didn't happen after all — a re-pause, a new seek,
+// someone stalling. Broadcasting again after cancelling means every client's
+// apply() re-runs and lands on whatever is actually true now, rather than
+// firing v.play() at a moment that no longer means anything.
+function cancelScheduledPlay(room) {
+  clearTimeout(room.playTimer);
+  room.playTimer = null;
+  room.playAt = null;
+}
+
 function getRoom(name) {
   if (!rooms.has(name)) {
     rooms.set(name, {
@@ -1835,6 +1853,8 @@ function getRoom(name) {
       stalled: new Set(),
       audio: 0,     // index into the file's audio tracks
       sub: -1,      // -1 = subtitles off
+      playAt: null,     // server-clock instant a scheduled resume fires at, or null
+      playTimer: null,  // the setTimeout backing it, so a re-pause can cancel it
     });
   }
   return rooms.get(name);
@@ -1873,6 +1893,11 @@ function stateMsg(room) {
     waitingFor: [...room.stalled].map((c) => c.name),
     audio: room.audio,
     sub: room.sub,
+    // Set only while a resume is scheduled but hasn't fired yet. `paused` is
+    // still true at this point — the room only actually starts playing once
+    // playAt passes — so a client that ignores this field sees a perfectly
+    // ordinary pause at the right position, just one that is about to end.
+    playAt: room.playAt,
   };
 }
 
@@ -1933,7 +1958,7 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'pong', t: msg.t, serverNow: Date.now() }));
         break;
 
-      case 'control': // play / pause / seek — host only
+      case 'control': { // play / pause / seek — host only
         if (!ws.isHost) {
           log(`! ${ws.name} tried to control playback without the key`);
           break;
@@ -1942,12 +1967,58 @@ wss.on('connection', (ws, req) => {
         // desync one client — it desyncs the room, permanently and silently.
         if (!Number.isFinite(msg.time) || msg.time < 0) break;
         vlog(`${ws.name}: ${msg.paused ? 'pause' : 'play'} @ ${(+msg.time).toFixed(2)}s`);
-        room.paused = !!msg.paused;
+
+        // A resume (paused -> playing) is the one transition worth scheduling
+        // rather than applying immediately. Every other case — pausing,
+        // seeking while already playing — takes effect at once, same as
+        // always: pausing has nowhere to schedule *to*, and scheduling a
+        // seek would just make scrubbing feel laggy for no syncing benefit,
+        // since drift correction already closes whatever gap it leaves.
+        //
+        // The point of a resume specifically is that "click play" and "the
+        // picture actually moves" are far apart in wall-clock time once you
+        // add network fan-out, and everyone's copy of that gap is a different
+        // length — so applying it immediately staggers everyone's start by
+        // however long their own trip happened to take. Scheduling a shared
+        // future instant and having every client (including the host) wait
+        // for it turns "as fast as possible, staggered" into "all at once,
+        // slightly delayed" — which is the trade being made here.
+        const resuming = !msg.paused && room.paused;
+        cancelScheduledPlay(room);
         room.time = msg.time;
         room.updatedAt = Date.now();
-        if (!room.paused) room.stalled.clear();
-        broadcast(room, { ...stateMsg(room), by: ws.name });
+
+        if (resuming) {
+          // Stay paused — at the target position — until playAt actually
+          // passes. room.paused deliberately stays true here: it is what
+          // keeps projectedTime() from advancing and what stops a stall from
+          // colliding with a resume that hasn't happened yet. stateMsg()
+          // reports this as an ordinary pause plus a playAt for anyone who
+          // knows to look at it, so a client that doesn't understand it yet
+          // just sees a correctly-positioned pause and nothing plays until a
+          // later message says otherwise.
+          room.playAt = Date.now() + PLAY_LEAD_MS;
+          broadcast(room, { ...stateMsg(room), by: ws.name });
+          room.playTimer = setTimeout(() => {
+            room.playTimer = null;
+            // Something could have intervened in the meantime — a pause, a
+            // new seek, a stall — and cancelScheduledPlay already cleared
+            // playAt in that case, so this timer firing after the fact would
+            // otherwise force a stale resume. Only actually start playing if
+            // this schedule is still the current one.
+            if (room.playAt === null) return;
+            room.playAt = null;
+            room.paused = false;
+            room.updatedAt = Date.now();
+            broadcast(room, stateMsg(room));
+          }, PLAY_LEAD_MS);
+        } else {
+          room.paused = !!msg.paused;
+          if (!room.paused) room.stalled.clear();
+          broadcast(room, { ...stateMsg(room), by: ws.name });
+        }
         break;
+      }
 
       // The host saying where they actually are. Not a control: it never
       // plays, pauses or seeks anyone, it only refreshes the anchor that room
@@ -2002,6 +2073,7 @@ wss.on('connection', (ws, req) => {
         if (!ws.isHost) break;
         const entry = library.get(msg.src);
         if (!entry) return;
+        cancelScheduledPlay(room);
         room.src = msg.src;
         room.label = entry.label;
         room.time = 0;
@@ -2193,6 +2265,7 @@ wss.on('connection', (ws, req) => {
     log(`- ${ws.name} left — ${room.clients.size} in room`);
     const wasHolding = room.stalled.delete(ws);
     if (room.clients.size === 0) {
+      cancelScheduledPlay(room);
       rooms.delete(room.name);
       // The encode queue deliberately keeps running. It used to be stopped
       // here, because encoding only happened for a file somebody was waiting
@@ -2200,6 +2273,12 @@ wss.on('connection', (ws, req) => {
       // an empty room is exactly when it should be getting on with it.
       return;
     }
+
+    // A pending resume assumed everyone still in `room.clients` at the moment
+    // it fires. Someone leaving mid-countdown — the host included — breaks
+    // that assumption, so let the next real control message decide again
+    // rather than have a stale timer un-pause a room whose situation changed.
+    cancelScheduledPlay(room);
 
     // Someone dropping mid-playback is the case this exists for: the rest of
     // the room should not watch on without them. `ws.bye` is set when the

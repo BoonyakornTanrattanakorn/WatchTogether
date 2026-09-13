@@ -1234,6 +1234,59 @@ function targetTime() {
   return state.time + elapsed;
 }
 
+// --- scheduled resume ---------------------------------------------------------
+// "Click play" and "the picture actually moves" are far apart once network
+// fan-out is involved, and everyone's copy of that gap is a different length
+// — so applying a resume the instant it's received staggers every viewer's
+// (and the host's own) start by whatever their own trip happened to take.
+//
+// The server schedules a resume instead of applying it: a `playAt` (its own
+// clock) rides along on an otherwise ordinary paused state at the target
+// position. Translating playAt through the same offset the drift loop already
+// trusts turns it into "wait, then play" for every client at once, host
+// included — see the server's 'control' handler for the broadcast side of
+// this, and control() above for how the host's own play button defers to it
+// instead of running ahead.
+let scheduledPlayAt = null; // the playAt this client is currently waiting on
+let scheduledPlayTimer = null;
+
+function cancelScheduledPlay() {
+  clearTimeout(scheduledPlayTimer);
+  scheduledPlayTimer = null;
+  scheduledPlayAt = null;
+}
+
+function scheduleOrApply(msg) {
+  if (!msg.playAt) {
+    // Nothing scheduled, or a later message (a real pause, a seek, a stall)
+    // superseded whatever was. Either way there is nothing left to wait for.
+    if (scheduledPlayAt !== null) cancelScheduledPlay();
+    if (!msg.paused) tryPlay();
+    return;
+  }
+
+  if (scheduledPlayAt === msg.playAt) return; // already waiting on this one
+
+  cancelScheduledPlay();
+  scheduledPlayAt = msg.playAt;
+  // clockReady gates the drift loop the same way: a playAt translated through
+  // an offset that has never been measured is not a wait, it is a guess.
+  // Falling back to firing immediately is safer than silently never playing.
+  const fireIn = clockReady ? msg.playAt - offset - Date.now() : 0;
+  dbg(`resume scheduled in ${Math.max(0, fireIn).toFixed(0)}ms`);
+  scheduledPlayTimer = setTimeout(() => {
+    scheduledPlayTimer = null;
+    scheduledPlayAt = null;
+    // The room could have moved on by the time this fires — paused again,
+    // stalled, a new file. `state` is kept current by every apply() call, so
+    // check it now rather than trust the snapshot this closure was built
+    // from: only play if the room the timer was scheduled for is still what
+    // is actually happening.
+    if (!state || state.paused) return;
+    tryPlay();
+  }, Math.max(0, fireIn));
+}
+
 // --- autoplay ----------------------------------------------------------------
 // A browser will not start playback with sound until this viewer has
 // interacted with the page. Guests therefore sit on a frozen frame while the
@@ -1389,13 +1442,24 @@ async function apply(msg) {
   if (msg.paused) {
     v.pause();
     // Paused is an exact anchor, so it is the one moment worth landing on
-    // precisely — there is no rate to nudge with while stopped.
-    if (!isHost && Math.abs(posInFile() - target) > 0.25) seekInFile(target);
+    // precisely — there is no rate to nudge with while stopped, and unlike
+    // the continuous drift loop there is no cost to correcting every time:
+    // a paused seek causes no audible stutter, so there is no reason to
+    // tolerate any gap here at all. Always seek, without a dead zone — the
+    // remaining error is only whatever <video>'s own seek granularity is
+    // (keyframe/decoder rounding), not anything this app leaves on the table.
+    //
+    // The host is exempt from the general case — they are the reference, and
+    // seeking them to a figure derived from their own last report is how a
+    // small reading error becomes a visible jump in the film they are
+    // hosting — but not from a scheduled resume: there they are one of the
+    // clients waiting for playAt, at the exact position they themselves
+    // requested, so landing on it precisely is just as correct for them.
+    if (!isHost || msg.playAt) seekInFile(target);
     // Don't nag about autoplay while the room is paused anyway.
     if (gateReason.startsWith('Your browser needs')) hideGate();
-  } else {
-    tryPlay();
   }
+  scheduleOrApply(msg);
 }
 
 // --- audio and subtitle tracks -----------------------------------------------
@@ -1901,10 +1965,41 @@ function send(type, extra = {}) {
 // health, so it stays obvious that suppressing them is never correct.
 const sendHealth = send;
 
+// Set around the v.pause() call below and cleared on a timer rather than
+// synchronously after it, because the 'pause' event it triggers is NOT
+// synchronous — it queues as a task and fires a millisecond or so later, by
+// which point a same-tick reset would already be undone. Without this flag,
+// that re-entrant control() call sends its own {paused:true} a couple of
+// milliseconds after the real {paused:false} resume request, and the server
+// processes both in order — so the second cancels the schedule the first
+// one just created, and the host's video never actually resumes. Confirmed
+// by tracing both sends reaching the server and the second genuinely hitting
+// the plain-pause branch there. 50ms is generous against a same-page event
+// task that in practice fires within ~2ms.
+let selfPausingForSchedule = false;
+
 function control() {
   if (applying) return;
   if (isHost) {
-    send('control', { paused: v.paused, time: posInFile() });
+    if (selfPausingForSchedule) return;
+    // A resume is the one transition that gets scheduled rather than applied
+    // immediately — see the server's 'control' handler for why. The host's
+    // own play button is native browser chrome and can't be intercepted
+    // before it fires, so the resulting 'play' event is caught here and
+    // paused straight back before the frame advances. scheduleOrApply(),
+    // called from apply() once the server echoes this back with a playAt,
+    // is what actually starts it — for the host exactly like everyone else.
+    // The visible effect is the host's own video also waiting out the same
+    // lead time, a brief pause-then-play instead of an instant one, which is
+    // the trade being made so "click play" means the same instant for
+    // everyone rather than a head start for whoever clicked it.
+    const resuming = !v.paused && state?.paused;
+    if (resuming) {
+      selfPausingForSchedule = true;
+      v.pause();
+      setTimeout(() => { selfPausingForSchedule = false; }, 50);
+    }
+    send('control', { paused: resuming ? false : v.paused, time: posInFile() });
   } else if (state) {
     // Not the host — snap straight back to whatever the room is doing.
     applying = true;
@@ -2089,14 +2184,34 @@ window.addEventListener('pagehide', () => sendHealth('ready'));
 // the rate branch either. They stayed wrong indefinitely, which is exactly the
 // "it's ahead and not even trying" case. The thresholds are now defined
 // together and the transcode floor is the smaller of them.
-const NUDGE = 0.15;        // below this, leave it alone
+//
+// NUDGE is not just a "don't bother" threshold — it is the steady-state error
+// the room settles at, because correction only engages once drift exceeds it.
+// A host's own playbackRate is never exactly 1.000, so given enough time an
+// untouched viewer always drifts up to NUDGE and sits there. Simulated at a
+// range of host clock noise: settled drift tracks NUDGE almost exactly,
+// independent of how hard rateFor() pulls. So "sync to under 100ms" is a
+// statement about NUDGE, not about pull strength — 50ms leaves headroom under
+// real network/clock jitter while staying comfortably under the 100ms where
+// audio/video misalignment becomes noticeable. The tick interval had to drop
+// from 1000ms to 250ms alongside it: checking once a second at a 50ms
+// tolerance means drift can travel most of the way back out of band between
+// checks, which just moves the same 150ms problem to a shorter dead zone
+// with a slower reaction to it.
+const NUDGE = 0.05;        // below this, leave it alone
 const HARD_SEEK = 2.5;     // above this, stop nudging and jump
+const DRIFT_TICK_MS = 250; // how often the band above is re-checked
 
 // How hard to lean. A viewer 2s out at 3% closes it in about a minute, which
 // is too slow to sit through, so the rate scales with the error and is capped
-// where it starts to be audible.
+// where it starts to be audible. A floor on the pull matters now that NUDGE is
+// small: at 60ms of drift the old `drift * 0.06` scaling asks for a 0.4% pull,
+// which does correct it — just slowly enough that clock jitter and the host's
+// own rate noise can outrun it. The floor guarantees a still-inaudible 2% pull
+// closes anything just outside the dead zone in a couple of seconds rather
+// than the better part of a minute.
 function rateFor(drift) {
-  const pull = Math.min(Math.abs(drift) * 0.06, 0.12);
+  const pull = Math.min(Math.max(Math.abs(drift) * 0.15, 0.02), 0.12);
   return drift > 0 ? 1 - pull : 1 + pull;
 }
 
@@ -2129,14 +2244,15 @@ setInterval(() => {
     v.playbackRate = 1;
   }
 
-  // A periodic heartbeat, so the log shows the steady state and not just
-  // the moments something went wrong.
-  if (DEBUG && ++driftTick % 10 === 0) {
-    dbg(`drift ${drift >= 0 ? '+' : ''}${drift.toFixed(3)}s  rate=${v.playbackRate.toFixed(3)}  offset=${offset.toFixed(0)}ms  buffered=${
+  // A periodic heartbeat, so the log shows the steady state and not just the
+  // moments something went wrong. Still roughly every 10s of wall time even
+  // though the tick itself sped up fourfold.
+  if (DEBUG && ++driftTick % (10000 / DRIFT_TICK_MS) === 0) {
+    dbg(`drift ${drift >= 0 ? '+' : ''}${(drift * 1000).toFixed(0)}ms  rate=${v.playbackRate.toFixed(3)}  offset=${offset.toFixed(0)}ms  buffered=${
       v.buffered.length ? (v.buffered.end(v.buffered.length - 1) - v.currentTime).toFixed(1) + 's ahead' : 'none'
     }`);
   }
-}, 1000);
+}, DRIFT_TICK_MS);
 
 // --- host heartbeat ----------------------------------------------------------
 // Room time is an anchor plus elapsed wall clock, and the anchor only used to

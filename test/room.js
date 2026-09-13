@@ -143,8 +143,17 @@ function waitForServer(tries = 40) {
   admin.send({ type: 'load', src: one.id });
   await wait(300);
   admin.send({ type: 'control', paused: false, time: 5 });
-  await wait(300);
-  say(admin.last('state').paused === false, 'the room is playing');
+  // A resume is scheduled rather than applied immediately (see mistakes.md
+  // #9 / architecture.md's Sync section) — the room reports paused:true with
+  // a playAt for PLAY_LEAD_MS before it actually starts, so a check right
+  // after sending 'control' has to look for the schedule, not the play.
+  await wait(150);
+  say(
+    admin.last('state').paused === true && Number.isFinite(admin.last('state').playAt),
+    'a resume is scheduled rather than applied immediately'
+  );
+  await wait(700);
+  say(admin.last('state').paused === false, 'the room is playing once the schedule fires');
 
   // --- a dropped connection stops the film -----------------------------------
 
@@ -163,7 +172,7 @@ function waitForServer(tries = 40) {
   const g2 = await open(guestCookie);
   await wait(300);
   admin.send({ type: 'control', paused: false, time: 6 });
-  await wait(300);
+  await wait(850); // past PLAY_LEAD_MS, so the schedule has fired
   g2.send({ type: 'bye' });
   await wait(150);
   g2.ws.close();

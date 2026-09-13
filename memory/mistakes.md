@@ -306,6 +306,92 @@ not a stand-in for it.
 
 ---
 
+## 8. A "don't bother" dead zone was silently a correctness gap on pause
+
+**Reported as:** "isn't it easier to just sync once when admin pause the
+video?" — a request that assumed the pause moment was already being handled
+well, when it was actually the more broken of the two paths.
+
+**Actually:** two separate dead zones existed for two different reasons, and
+they got confused with each other. The continuous drift loop's `NUDGE` (then
+0.15s) is a genuine tradeoff — leaving small drift alone avoids seeking (and
+its stutter) for something the rate-nudge would close anyway. But the pause
+snap used the *same kind* of threshold (`> 0.25`) for a completely different
+reason that no longer applied: there is no stutter cost to a seek while
+paused, so tolerating any gap there bought nothing and just left a viewer
+who happened to be 100-249ms out sitting there wrong, on a paused frame,
+indefinitely — the exact moment correcting is free was the one place a gap
+was allowed to persist forever.
+
+**Fix:** `NUDGE` tightened to 0.05s with a matching floor on the rate pull and
+a faster (250ms) check interval, since a wider dead zone is itself the
+settled-state error (see architecture.md's Sync section). Separately, the
+pause snap now always seeks with no dead zone at all — verified at 1ms
+precision recovering from gaps between 150ms and 1.2s, using two real browsers
+against the real server, not a simulation.
+
+**What would have found it sooner:** the two thresholds were solving different
+problems (avoid audible correction vs. don't bother for a small gap) but
+shared a name-shaped instinct — "there's a tolerance here, so smaller changes
+don't matter." Worth asking, for every dead zone: what does leaving this alone
+actually cost, and is that cost still true at this call site, or was it copied
+from one where it was.
+
+---
+
+## 9. A synchronous-looking pause() isn't synchronous, and it cancelled its own schedule
+
+**Reported as:** "the video syncs perfectly when i pause however there is a
+noticable delay between when admin click unpause and the client video start
+playing... can't you do some kind of syncing protocol so that both admin and
+client video will start playing on the same time."
+
+**The feature:** a resume is scheduled rather than applied immediately — the
+server picks a near-future instant, every client (including the host)
+schedules a local `v.play()` for it via the same clock offset the drift loop
+already trusts, so "click play" lands at the same moment for everyone instead
+of staggering by however long each person's network leg took. See
+architecture.md's Sync section for the full design.
+
+**The bug this introduced:** the host's own play button is native browser
+chrome and can't be intercepted before it fires, so the plan was to catch the
+resulting `play` event and immediately call `v.pause()` back — stopping the
+host's own video from running ahead while it waits out the same schedule as
+everyone else. `v.pause()` fires a `pause` event, which the app's own listener
+routes back into `control()` — so this single click produces **two**
+`control` messages: the intended `{paused:false}` from the click, and an
+unintended `{paused:true}` from the reactive pause milliseconds later. The
+second cancels the schedule the first one just created, silently — the
+server, correctly following its own contract, treats a plain pause as
+superseding a scheduled resume. The host's video (and, since it never gets
+told otherwise, the whole room) never actually starts.
+
+**Why it was hard to catch:** everything about the send order was correct —
+the client only ever intended to send the resume — and the server-side logic
+being "fooled" was in fact behaving exactly as designed; it has no way to
+know a pause it just received was the client's own bookkeeping rather than a
+person's decision. The failure was entirely in an assumption about timing:
+`v.pause()` *reads* as synchronous (nothing awaits it), so a flag set before
+the call and cleared immediately after looks like it should bracket the
+resulting event — and does not, because `pause` fires as a queued task, not
+inside the synchronous call. Tracing showed it landing about 1-2ms later,
+comfortably outside a same-tick guard but well inside "looks instant" to a
+human.
+
+**Fix:** the suppression flag is cleared on a short timer (50ms) instead of
+immediately after `v.pause()` returns.
+
+**What would have found it sooner:** distrust any assumption that a DOM
+element's method and the event it triggers are synchronous with each other,
+even when the method itself has no visible async signature (no promise, no
+callback parameter). `play()` is a documented promise; `pause()` looks
+"simpler" and isn't. The thing that actually found this was capturing the
+literal bytes sent to the server in order, with timestamps — the number of
+messages and their spacing said everything, where reasoning about the code
+alone kept looking correct.
+
+---
+
 ## 6. A test that silently stopped testing
 
 `test/cpu.js` built its fixture by encoding 600s of 1080p HEVC within a 120s
