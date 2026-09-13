@@ -1,0 +1,18 @@
+services:
+  watch-together:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      - MEDIA_DIRS=/media
+      - PORT=8090
+      - DATA_DIR=/data
+      #- RECURSIVE=1
+      #- SETUP_TOKEN=change-me
+      #- TRANSCODE_CACHE_GB=20
+      #- TRANSCODE_THREADS=2
+      #- ALLOW_REGISTRATION=1
+    volumes:
+      - ./data:/data
+      - /path/to/your/library:/media:ro
