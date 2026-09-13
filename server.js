@@ -1247,20 +1247,40 @@ const startedAt = Date.now();
 
 // --- request helpers ---------------------------------------------------------
 
+// The chunks are kept as Buffers and decoded once at the end, never
+// concatenated as strings.
+//
+// `body += chunk` coerces each chunk to UTF-8 independently, so a multi-byte
+// character split across a TCP chunk boundary is decoded as two invalid halves
+// and comes out as replacement characters. The password is then wrong through
+// no fault of the person typing it — and only sometimes, because where the
+// boundary falls depends on MTU and timing. A VPN changes both, which is why
+// this looked like "I can't log in over the VPN" rather than like an encoding
+// bug. It corrupted usernames and invite codes the same way.
+//
+// The cap counts bytes rather than string length, since bytes are what was
+// actually read and what the limit is meant to bound.
 function readBody(req, limit = 8 * 1024) {
   return new Promise((resolve) => {
-    let body = '';
+    const chunks = [];
+    let size = 0;
     let over = false;
     req.on('data', (chunk) => {
       if (over) return;
-      body += chunk;
+      size += chunk.length;
       // A login form is a few hundred bytes. Anything larger is not a form.
-      if (body.length > limit) {
+      if (size > limit) {
         over = true;
-        body = '';
+        chunks.length = 0;
+        return;
       }
+      chunks.push(chunk);
     });
-    req.on('end', () => resolve(over ? null : Object.fromEntries(new URLSearchParams(body))));
+    req.on('end', () => {
+      if (over) return resolve(null);
+      const body = Buffer.concat(chunks).toString('utf8');
+      resolve(Object.fromEntries(new URLSearchParams(body)));
+    });
     req.on('error', () => resolve(null));
   });
 }

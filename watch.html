@@ -68,6 +68,20 @@
     margin-right: 0.5rem;
     vertical-align: 0.1em;
   }
+  /* `#status` takes the `margin-left: auto`, so this sits beside it at the
+     far end rather than needing one of its own. */
+  #fullBtn {
+    flex: 0 0 auto;
+    border: 0;
+    background: none;
+    color: var(--dim);
+    font-size: 1rem;
+    line-height: 1;
+    padding: 0.2rem 0.35rem;
+    cursor: pointer;
+    align-self: center;
+  }
+  #fullBtn:hover { color: var(--signal); }
   /* --- shell --------------------------------------------------------------
      Video left, sidebar right. The sidebar is a fixed column so the video
      never reflows as its contents change; below 60rem it drops underneath. */
@@ -103,57 +117,32 @@
       grid-template-rows: minmax(0, auto) minmax(0, 1fr);
     }
     body.host main { padding: 0.75rem; }
-    body.host video { max-height: 45dvh; }
+    /* The cap goes on the stage, not the video inside it. Capping the video
+       alone left the stage at its full aspect-ratio height with a shorter
+       picture inside — and since the subtitle canvas is positioned against the
+       stage, the lines were drawn below the frame. Measured at 800x600 as an
+       admin: stage 436.5px tall, video 270px. Sizing the stage keeps the two
+       the same rectangle, which is the invariant everything here depends on. */
+    body.host #stage { max-height: 45dvh; }
     #side { border-left: 0; border-top: 1px solid var(--line); }
   }
 
   /* --- guests -------------------------------------------------------------
      A viewer has nothing to administer and nothing to choose: the library,
-     stats, log and account controls are all the host's. So they get the
-     player and nothing else, at whatever size the window allows. The sidebar
-     is not merely hidden — it is removed from the layout, so the grid has one
-     column and the video has the whole width. */
-  body.guest header { display: none; }
+     stats, log and account controls are all the host's. So the sidebar is
+     removed from the layout rather than hidden, and the grid has one column.
+
+     They do keep the header. It used to be hidden too, which left a viewer
+     with an edge-to-edge picture and nowhere to put anything else — no
+     connection status, no way to see what was playing, and no fullscreen
+     control of their own. Chasing "no chrome at all" is also what made the
+     layout fragile: with nothing above the video, every overflow problem had
+     to be solved by making the picture exactly the viewport, and anything that
+     did not fit was simply clipped. A normal windowed player with a slim header
+     above it has none of those problems, and fullscreen is then a choice
+     rather than the only way to see the bottom of the subtitles. */
   body.guest #side { display: none; }
   body.guest #shell { grid-template-columns: 1fr; }
-  body.guest main { padding: 0; }
-  body.guest #stage { max-width: none; }
-  body.guest video { max-width: none; border-radius: 0; }
-
-  /* The player is the whole page for a viewer, so it should grow to the window
-     rather than stop at the file's own pixel size. `width/height: auto` did
-     the latter: a 1920x1080 file sat at 1920x1080 in a 2560px window with a
-     black border around it, and anything smaller than the window stayed
-     postage-stamp sized.
-
-     So the stage is given the pane and an `aspect-ratio` matching the picture,
-     which `--ar` carries from the video's real dimensions. The ratio makes the
-     box letterbox itself: whichever of width/height binds first, the other
-     follows, and `main`'s centring grid absorbs the leftover. The stage is
-     therefore exactly the rendered picture at every window shape — which is
-     what the subtitle canvas is positioned against, so subtitles land on the
-     frame instead of below it. */
-  body.guest #stage {
-    width: 100%;
-    height: 100%;
-    aspect-ratio: var(--ar, 16 / 9);
-    max-width: 100%;
-    max-height: 100%;
-    /* Both must be auto-able for aspect-ratio to letterbox rather than
-       stretch: the binding dimension wins and the other is derived. */
-    margin: auto;
-    line-height: 0;  /* no inline-descender gap under the video */
-  }
-  body.guest video {
-    width: 100%;
-    height: 100%;
-    max-width: none;
-    max-height: none;
-    /* The stage already has the picture's ratio, so contain is a no-op in the
-       steady state — it only matters for the frame or two between a new file
-       loading and --ar being updated, where it prevents a visible stretch. */
-    object-fit: contain;
-  }
 
   #tabs { display: flex; border-bottom: 1px solid var(--line); }
   #tabs .tab {
@@ -777,6 +766,9 @@
   <span id="viewers"></span>
   <span id="role"></span>
   <span id="status">connecting</span>
+  <!-- Everyone's own control, host included: it only changes what this
+       browser is showing, never what the room is doing. -->
+  <button id="fullBtn" type="button" title="Fullscreen (f)" aria-label="Fullscreen">⛶</button>
 </header>
 
 <div id="shell">
@@ -1105,8 +1097,11 @@ function connect() {
       encodeData = msg;
       if (newlyDone) {
         // The probe's `cached` flag changed too, so drop what we remembered.
+        // Both flags, or applyTracks would go on trusting a list we have just
+        // declared stale.
         if (tracksFor && msg.items.some((i) => i.status === 'done' && i.id === tracksFor)) {
           tracksFor = null;
+          tracksReadyFor = null;
         }
         loadLibrary();
       } else {
@@ -1384,12 +1379,18 @@ async function apply(msg) {
 // the same subs. Only the host can change them.
 
 let tracks = { audio: [], subs: [] };
-let tracksFor = null;   // which file id `tracks` describes
+let tracksFor = null;   // which file id `tracks` is being or has been read for
+// Which file id `tracks` actually *describes*. Distinct from tracksFor, which
+// is claimed before the fetch starts: for the width of that request the two
+// disagree, and during it `tracks` is empty. applyTracks keys off this one, so
+// it cannot mistake "not fetched yet" for "this file has no subtitles".
+let tracksReadyFor = null;
 let wantAudio = 0, wantSub = -1;
 
 async function loadTracks(id) {
   if (tracksFor === id) return;
   tracksFor = id;
+  tracksReadyFor = null;
   tracks = { audio: [], subs: [] };
   try {
     tracks = await fetch('/tracks/' + id).then((r) => r.json());
@@ -1397,6 +1398,7 @@ async function loadTracks(id) {
     // ffprobe missing or the probe failed — just hide the pickers.
   }
   if (tracksFor !== id) return; // a different file loaded while we waited
+  tracksReadyFor = id;
   dbg(`tracks: ${tracks.audio.length} audio, ${tracks.subs.length} subtitle`);
   fillTrackMenus();
 
@@ -1603,6 +1605,20 @@ async function startJassub(id, n, label) {
 // Put the <track> elements in place and enable the chosen one.
 function applyTracks() {
   if (!loaded) return;
+
+  // The track list has to describe the file that is actually loaded before any
+  // of this means anything. `tracks` is filled in by loadTracks, which is a
+  // fetch — so between a state message naming a new file and that fetch
+  // landing, tracks.subs is empty and every index into it reads as "no such
+  // track".
+  //
+  // That matters because this function is re-asserted on every state message,
+  // and the host heartbeat makes those arrive every couple of seconds. Falling
+  // through with an empty list takes the WebVTT branch below, which starts by
+  // destroying the libass renderer — so a working subtitle canvas was being
+  // torn down by a routine heartbeat and never rebuilt. Wait instead: whoever
+  // fills in `tracks` calls this again.
+  if (tracksReadyFor !== loaded) return;
 
   audioSel.value = String(wantAudio);
   subSel.value = String(wantSub);
@@ -1832,11 +1848,34 @@ document.getElementById('inviteForm').onsubmit = (e) => {
   });
 };
 
+// The echo guard applies to exactly one message type: `control`.
+//
+// It exists because obeying a state message means calling seek/play/pause on
+// our own element, which fires the same events a person pressing the button
+// would — and sending that back would bounce the room's own state at it. That
+// is the only echo there is.
+//
+// It used to gate *every* outbound message, which was three separate bugs.
+// `stall` and `ready` were swallowed for the 300ms after every state message,
+// and a seek fires `waiting` inside exactly that window — so the room never
+// learned the viewer was buffering, the matching `ready` could be dropped too,
+// and the viewer sat stopped while the host played on. (That is the "I seek
+// and the client just sits there paused" case, and the host heartbeat made the
+// window of silence come round every two seconds.) Admin commands were dropped
+// the same way: clicking Encode just after a state message did nothing at all.
+// None of those can echo — they say something about this browser's buffer or
+// are a deliberate instruction, neither of which the server replays at us.
+const ECHOABLE = new Set(['control']);
+
 function send(type, extra = {}) {
-  if (!applying && ws?.readyState === 1) {
-    ws.send(JSON.stringify({ type, ...extra }));
-  }
+  if (ws?.readyState !== 1) return;
+  if (applying && ECHOABLE.has(type)) return;
+  ws.send(JSON.stringify({ type, ...extra }));
 }
+
+// Kept as a distinct name at the call sites that report this browser's own
+// health, so it stays obvious that suppressing them is never correct.
+const sendHealth = send;
 
 function control() {
   if (applying) return;
@@ -1922,11 +1961,29 @@ v.addEventListener('webkitbeginfullscreen', () => {
   } catch {}
 });
 
-// Double-click is the other way people go fullscreen on a video, and it has
-// the same problem. Bind it on the stage so it works over the subtitles too.
-stageEl.addEventListener('dblclick', () => {
+// Fullscreen is the viewer's own choice, not the room's: the player is a
+// normal windowed one, and this makes it fill the screen when they want that.
+// Always the stage, never the <video>, so the subtitle canvas comes too.
+function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
   else stageEl.requestFullscreen?.();
+}
+
+document.getElementById('fullBtn').onclick = toggleFullscreen;
+
+// Double-click is the other way people go fullscreen on a video, and it has
+// the same problem. Bind it on the stage so it works over the subtitles too.
+stageEl.addEventListener('dblclick', toggleFullscreen);
+
+// `f` is what every other player uses. Ignored while typing, or the library
+// filter would swallow the letter instead.
+addEventListener('keydown', (e) => {
+  if (e.key !== 'f' || e.ctrlKey || e.metaKey || e.altKey) return;
+  const el = document.activeElement;
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA')) return;
+  if (accountsDlg.open) return;
+  e.preventDefault();
+  toggleFullscreen();
 });
 
 v.addEventListener('play', control);
@@ -1939,18 +1996,26 @@ v.addEventListener('seeked', control);
 v.addEventListener('waiting', () => {
   if (!v.paused && v.readyState < 3 && Date.now() - joinedAt > 2000) {
     dbg(`buffering at ${v.currentTime.toFixed(2)}s (readyState=${v.readyState})`);
-    send('stall');
+    sendHealth('stall');
   }
 });
 
-const ready = () => send('ready');
+// Buffering is over. Tell the room, and make sure we are actually moving
+// again: a seek can leave the element paused with nothing queued to restart
+// it, so a viewer would sit on a still frame while the room played on. tryPlay
+// returns immediately when we are already playing audibly, so this is cheap on
+// the common path.
+const ready = () => {
+  sendHealth('ready');
+  if (state && !state.paused && v.paused && loaded) tryPlay();
+};
 v.addEventListener('playing', ready);
 v.addEventListener('canplay', ready);
 v.addEventListener('canplaythrough', ready);
 
 // A file this browser can't decode must not leave the room waiting on us.
 v.addEventListener('error', () => {
-  send('ready');
+  sendHealth('ready');
   const codes = ['', 'playback aborted', 'network error', "this browser can't decode this file", 'file not supported'];
   const why = codes[v.error?.code] || 'playback failed';
   hintEl.textContent = why;
@@ -1962,7 +2027,9 @@ v.addEventListener('error', () => {
 });
 v.addEventListener('stalled', ready);
 v.addEventListener('emptied', ready);
-window.addEventListener('pagehide', ready);
+// Leaving the page: release the hold, but do not try to start playing a video
+// that is on its way out.
+window.addEventListener('pagehide', () => sendHealth('ready'));
 
 // --- drift correction --------------------------------------------------------
 // Runs on viewers only. The host *defines* room time, so measuring them

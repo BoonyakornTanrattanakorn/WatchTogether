@@ -38,8 +38,19 @@ and the encode queue — which is most of what makes awkward files playable.
 | `npm run doctor` | Report what is installed and what each gap costs |
 | `npm test` | The whole suite |
 | `npm run test:unit` | Just the fast in-process tests |
-| `npm run test:gate` / `:ws` / `:admin` / `:room` / `:cpu` | One suite at a time |
+| `npm run test:body` / `:gate` / `:ws` / `:admin` / `:room` / `:cpu` | One suite at a time |
 | `npm run reset-admin -- <username>` | Reset a password and promote to admin |
+
+The `cpu` suite watches ffmpeg's process lifetime while it encodes, which
+means its fixture has to stay slow enough to observe mid-flight. That used to
+be 600s of 1080p at 24fps inside a 120s budget — marginal enough that a
+loaded machine missed the window, and the failure mode was the suite quietly
+reporting "no ffmpeg/libx265" and skipping every assertion rather than
+failing. The fixture is now 4fps instead (the re-encode still has to walk the
+whole timeline, so it stays observably slow) with a larger budget, and a
+fixture timeout now fails the suite instead of masquerading as a legitimate
+skip. The whole suite went from roughly 2 minutes, and often skipping, to a
+reliable 40 seconds.
 
 On a first run the server prints a setup token it generated for that run. Open
 `/setup`, enter that token, and create the admin account. This is a
@@ -81,6 +92,27 @@ request, because role and status are read from the database rather than trusted
 from the session cookie.
 
 Passwords are scrypt-hashed. Sessions are a signed cookie, valid 30 days.
+
+The request body used to be assembled with `body += chunk`, which coerces
+each incoming Buffer to a UTF-8 string independently. A multi-byte character
+split across a TCP chunk boundary decoded as two invalid halves on either
+side of the split and came out as replacement characters — silently wrong,
+not an error. That corrupted a password, username or invite code containing
+any non-ASCII character, and only sometimes, because where the split falls
+depends on packet timing and MTU. A VPN changes both, which is why it looked
+like "I can't log in when I'm on a VPN" rather than an encoding bug. Fixed by
+collecting the chunks as Buffers and decoding once —
+`Buffer.concat(chunks).toString('utf8')` — after which the size cap counts
+bytes rather than string length. Measured against a body containing 2-, 3-
+and 4-byte UTF-8 characters: 11 of the 52 possible split points corrupted it
+under the old code, 0 under the new. `test/body.js` (`npm run test:body`)
+drives this over a raw socket, writing the body in two `write()` calls to
+force a chunk boundary, and checks login succeeds at every offset. It has to
+bypass a normal HTTP client to do that — a browser form submit percent-encodes
+non-ASCII before it hits the wire, so the bytes are pure ASCII and a browser
+could never trigger this. The test sends raw UTF-8, which is what the
+clients that *don't* percent-encode send, and is the population the bug
+actually hurt.
 
 Invites and approvals are handled from the **Accounts** panel in the footer,
 which admins see and viewers do not. It runs over the same WebSocket as
@@ -212,11 +244,13 @@ click fixes it.
 
 You control your own volume and fullscreen. Everything else is the host's.
 
-The player fills the window, so subtitles are readable without going
-fullscreen — and if you do go fullscreen, by the video's own button or by
-double-clicking the picture, the subtitles come with you.
-
-You see the player and nothing else — the sidebar of controls is the host's.
+You get the same slim header the host has — title, "N watching", connection
+status — and a normal windowed player under it, with a fullscreen button
+(`⛶`) in the header alongside the rest; double-clicking the picture or
+pressing `f` does the same thing. Fullscreen always takes the whole stage,
+not just the `<video>`, so the subtitle canvas comes with you and you can
+still read the bottom line. The sidebar of tabs — library, stats, log,
+accounts — is the host's; you don't get it, but you do get everything else.
 
 Two things that will happen and are not faults: **signing in on another device
 signs this one out** — one account is one browser — and **the film pauses for
@@ -238,7 +272,10 @@ pages.js     Server-rendered login / register / setup pages.
 watch.html   The player, sidebar, encode panel and accounts panel. No build
              step.
 test/        Plain-node tests: the access-gate matrix, account management,
-             room behaviour, and encoder lifetime. `npm test`.
+             room behaviour, request-body decoding, and encoder lifetime.
+             `npm test`.
+memory/      Notes for whoever works on this next: how it is built, and which
+             bugs were expensive to find.
 data/        app.db lives here. Gitignored.
 ```
 
@@ -442,6 +479,21 @@ and displays but cannot actually change the playing track. Safari honours it.
 For dual-audio files where this matters, the workaround is a file with a
 single audio track.
 
+**The host heartbeat used to tear down a working libass renderer.** Track
+selection is re-applied on every state message rather than only once, so that
+a renderer torn down by a reconnect gets rebuilt — but re-applying fell
+through to the WebVTT branch, which begins by calling `destroyJassub()`,
+whenever the track list wasn't loaded yet. A routine heartbeat arriving while
+the `/tracks/` probe for a just-opened file was still in flight tore down a
+working canvas that had rendered a moment earlier, and nothing rebuilt it. The
+obvious guard doesn't work: the flag that names which file `tracks` is being
+read for is claimed before the fetch even starts, so it's already set to the
+new file and can't tell "not loaded yet" from "loaded, and this one". A
+second flag, `tracksReadyFor`, now records which file the list actually
+*describes*, and applying tracks returns early unless it matches — the
+re-assertion on every state message stays, only the teardown-on-unknown-list
+is gone.
+
 ## The player
 
 The stage — the box the video, the subtitle canvas and the click-to-join
@@ -465,20 +517,38 @@ sibling of it, not a child — so it stays behind on the page and subtitles
 vanish at the moment a viewer most wants them. A `fullscreenchange` handler
 catches that and promotes the stage instead; Safari's element-only fullscreen
 is caught through `webkitbeginfullscreen`, and double-clicking the stage does
-the same thing directly.
+the same thing directly. There is also an explicit fullscreen button (`⛶`)
+in the header, and the `f` key, for anyone who would not think to
+double-click the picture.
 
 ## The sidebar
 
 **Admins only.** A viewer has nothing to administer and nothing to choose — the
-library, stats, log and account controls are all the host's — so they get an
-edge-to-edge player and the header, and nothing else. The sidebar is removed
-from the layout rather than hidden, so the video takes the full width.
+library, stats, log and account controls are all the host's — so the sidebar
+is removed from the layout rather than hidden, and the video takes the full
+width. They keep the header, though, and get a normal windowed player rather
+than an edge-to-edge one: chasing "no chrome at all" for viewers used to mean
+solving every overflow problem by making the picture exactly the viewport and
+clipping anything that didn't fit, which is more fragile than just giving
+them a header and letting the player be a window like the host's.
 
 The page itself never scrolls, at any window size. `body` is a hard `100dvh`
 with `overflow: hidden`, and every list that can grow scrolls inside its own
 pane. Panels are bounded by their container rather than by `dvh` units, which
 is what used to overflow: a `78dvh` video ignores the header above it, and a
 stacked sidebar below 60rem took its natural height on top of that.
+
+That bounding has to hold the stage and the video to the *same* rectangle, or
+the subtitle canvas — which is positioned against the stage, not the video —
+comes loose from the picture. Below the 60rem breakpoint the video was capped
+at `max-height: 45dvh` but the surrounding `#stage` box was not, so at
+800x600 as an admin the stage sat 436.5px tall around a 270px picture and
+subtitles were drawn into the gap below the frame instead of on it. The cap
+now goes on `#stage` itself, so the two shrink together. Checked by driving
+headless Edge over CDP across 8 viewport sizes and both roles (16
+combinations, including boundary probes either side of 960px): the stage and
+video rects coincide exactly in all 16, and the page never scrolls in any of
+them.
 
 Four tabs beside the video, replacing what used to be a row of controls along
 the bottom.
@@ -562,6 +632,22 @@ an estimate quickly, then every five seconds after that — which doubles as the
 keepalive through the tunnel. The correction refuses to act at all until the
 clock has been measured once.
 
+**The echo guard only covers `control`.** Obeying a state message means
+calling seek/play/pause on our own element, which fires the same events a
+person pressing the button would — and echoing those back would bounce the
+room's own state at it, so outbound messages are suppressed for 300ms after
+applying one. That guard used to cover every outbound message, which was
+three separate bugs at once: a seek fires the `waiting` event inside exactly
+that window, so `stall` was swallowed and the server never learned a viewer
+was buffering; the matching `ready` could be dropped too, leaving the viewer
+stopped on a still frame while the host played on; and the host's own
+heartbeat, every two seconds, made that window of silence come round
+constantly. It also ate admin commands that arrived at the wrong moment —
+clicking Encode just after a state message did nothing. The guard now names
+what it actually applies to (an `ECHOABLE` set containing only `control`),
+and `ready` additionally restarts playback if the room is playing and we are
+paused, so a seek can no longer strand a viewer on a frozen frame.
+
 ## Interruptions
 
 **Someone's connection drops mid-film and the room pauses**, with a notice
@@ -639,7 +725,11 @@ content through the proxy, and video is the named example.
 
 **Echo suppression is timing-based.** `applying` is released on a 300ms timer
 rather than on the promise, because `v.play()` can stay pending indefinitely
-while buffering. A sequence number on state messages would be correct.
+while buffering. It now only gates the one message type that can actually
+echo (`control`), so a stuck timer can no longer swallow `stall`, `ready` or
+an admin command — but a `control` sent by a person, not the room, in that
+300ms window is still dropped. A sequence number on state messages would be
+correct.
 
 **The rate limiter trusts `X-Forwarded-For`.** Behind the tunnel every request
 arrives from the same socket, so the client IP has to come from that header —
@@ -648,6 +738,13 @@ guessing from a single host and is not more than that. Cloudflare Access in
 front of the tunnel remains the stronger answer.
 
 ## Design notes worth preserving
+
+Two longer documents sit in `memory/`, for anyone about to change something
+rather than just run it. [architecture.md](memory/architecture.md) covers how
+the pieces fit and which parts are load-bearing;
+[mistakes.md](memory/mistakes.md) records the bugs that were expensive to find,
+with what would have found each one sooner. Worth reading before touching sync,
+subtitles or layout — all three have bitten more than once.
 
 **Files are addressed by opaque id, never by path.** `/media/<sha1-prefix>`
 looks up a pre-built index, so there is no traversal to defend against. The id
@@ -686,8 +783,11 @@ viewers get only a headcount, so nobody re-seeks when someone walks in.
    since ffmpeg cannot append to it.
 5. **Queue a whole folder at once.** Queueing a 26-episode season one row at a
    time is the obvious next annoyance now that encoding is explicit.
-6. A sequence number on state messages, to replace the timing-based echo guard
-   below.
+6. A sequence number on state messages, which would let the echo guard drop
+   its 300ms timer entirely. Less urgent now that the guard only covers
+   `control` — the failure modes that made it costly are gone — but the
+   remaining edge (a real `control` sent by a person in the same window as a
+   remote one) is still there in principle.
 
 ## License
 

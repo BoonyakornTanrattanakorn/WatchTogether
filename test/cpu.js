@@ -25,21 +25,47 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-cpu-'));
 const MEDIA = path.join(tmp, 'media');
 fs.mkdirSync(MEDIA, { recursive: true });
 
-// Long enough that an encode cannot finish while we are watching it: the whole
-// point is to observe processes mid-flight.
+// Long enough that the server's re-encode of it cannot finish while we are
+// watching it: the whole point is to observe processes mid-flight.
+//
+// What has to be expensive is the *re-encode*, not building this fixture. So
+// the source is long in duration but cheap in frames — ten minutes at 4fps
+// rather than 24. The server re-encodes to H.264 at a fixed `-g 48` and has to
+// walk the whole timeline either way, so it stays comfortably slower than the
+// test, while making the fixture costs a fraction of what it did.
+//
+// It used to be 600s at 24fps inside a 120s budget, which was marginal enough
+// that a busy machine missed it — and the failure mode was this suite quietly
+// reporting "no ffmpeg/libx265" and skipping every assertion. A test that
+// stops protecting you without saying so is worse than one that fails, hence
+// the generous budget below as well.
 let have = false;
+let fixtureError = null;
 const started = Date.now();
 try {
   execFileSync('ffmpeg', [
-    '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=24:duration=600',
+    '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=4:duration=600',
     '-c:v', 'libx265', '-preset', 'ultrafast', '-crf', '32', '-pix_fmt', 'yuv420p10le',
     path.join(MEDIA, 'big.mkv'), '-y',
-  ], { stdio: 'ignore', timeout: 120000 });
+  ], { stdio: 'ignore', timeout: 300000 });
   have = fs.existsSync(path.join(MEDIA, 'big.mkv'));
-} catch {}
+} catch (e) {
+  // Distinguish "this machine cannot encode HEVC" from "it can, but not in
+  // time". The first is a legitimate skip; the second is a broken fixture
+  // masquerading as one.
+  fixtureError = e;
+}
 if (!have) {
-  console.log('note: no ffmpeg/libx265, skipping the encoder-lifetime checks');
-  process.exit(0);
+  const why =
+    fixtureError && (fixtureError.killed || fixtureError.signal)
+      ? `building the test fixture timed out after ${((Date.now() - started) / 1000).toFixed(0)}s — ` +
+        'the machine is too loaded, or the budget is too tight. Not skipping quietly: ' +
+        'rerun when it is idle, or raise the timeout.'
+      : 'no ffmpeg/libx265, skipping the encoder-lifetime checks';
+  console.log(`note: ${why}`);
+  // A timeout is a broken fixture, not an absent encoder, so it fails rather
+  // than passing with nothing checked.
+  process.exit(fixtureError && (fixtureError.killed || fixtureError.signal) ? 1 : 0);
 }
 // A second file to queue behind the first, so "one at a time" has something to
 // be true about. A copy rather than a second encode: the id is a hash of the
@@ -55,8 +81,8 @@ const elapsed = Date.now() - started;
 const size = fs.statSync(path.join(MEDIA, 'big.mkv')).size;
 if (elapsed < 1000 || size < 10000) {
   console.log(
-    `note: ffmpeg encoded 90s of video in ${elapsed}ms to ${size} bytes — it is ` +
-      'not really encoding here, so the encoder-lifetime checks cannot run.'
+    `note: ffmpeg encoded 10 minutes of video in ${elapsed}ms to ${size} bytes — it ` +
+      'is not really encoding here, so the encoder-lifetime checks cannot run.'
   );
   console.log('SKIPPED (unverified)');
   process.exit(0);
