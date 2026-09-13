@@ -8,11 +8,11 @@ services:
       - MEDIA_DIRS=/media
       - PORT=8090
       - DATA_DIR=/data
-      #- RECURSIVE=1
-      #- SETUP_TOKEN=change-me
-      #- TRANSCODE_CACHE_GB=20
-      #- TRANSCODE_THREADS=2
-      #- ALLOW_REGISTRATION=1
+      - RECURSIVE=${RECURSIVE:-0}
+      - SETUP_TOKEN=${SETUP_TOKEN:-}
+      - TRANSCODE_CACHE_GB=${TRANSCODE_CACHE_GB:-20}
+      - TRANSCODE_THREADS=${TRANSCODE_THREADS:-}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-1}
     volumes:
       - ./data:/data
-      - /path/to/your/library:/media:ro
+      - ${MEDIA_PATH}:/media:ro
