@@ -1,0 +1,29 @@
+{
+  "name": "watch-together",
+  "version": "1.0.0",
+  "description": "Self-hosted video sync app. An admin controls playback; everyone else watches in a browser with no install.",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --verbose",
+    "doctor": "node scripts/doctor.js",
+    "reset-admin": "node server.js --reset-admin",
+    "test": "node test/run.js && node test/db.js && node test/auth.js && node test/ids.js && node test/gate.js && node test/ws.js && node test/admin.js && node test/room.js && node test/cpu.js",
+    "test:unit": "node test/run.js && node test/db.js && node test/auth.js && node test/ids.js",
+    "test:gate": "node test/gate.js",
+    "test:ws": "node test/ws.js",
+    "test:admin": "node test/admin.js",
+    "test:room": "node test/room.js",
+    "test:cpu": "node test/cpu.js"
+  },
+  "dependencies": {
+    "jassub": "^2.5.16",
+    "ws": "^8.21.3"
+  }
+}

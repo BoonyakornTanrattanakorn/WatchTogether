@@ -1,0 +1,2584 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch together</title>
+<style>
+  :root {
+    --ink: #0d0e12;
+    --panel: #16181f;
+    --line: #262a35;
+    --text: #dfe1e6;
+    --dim: #878d9c;
+    --signal: #d8a657;
+  }
+  * { box-sizing: border-box; }
+  /* The app owns the viewport and nothing scrolls it: every list that can grow
+     scrolls inside its own pane instead. min-height would let the page grow
+     past the screen, so this is a hard height. */
+  html { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem 1.25rem;
+    flex-wrap: wrap;
+    padding: 0.9rem 1.25rem;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 0.95rem; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
+  #now {
+    color: var(--signal);
+    font-size: 0.85rem;
+    flex: 1 1 14rem;
+    min-width: 0;
+    /* Clamp to two lines rather than one — long release names carry the
+       useful part (year, edition, resolution) at the end. */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+  #now:empty { display: none; }
+  #viewers, #status { flex: 0 0 auto; }
+  #viewers { color: var(--dim); font-size: 0.85rem; }
+  #status {
+    margin-left: auto;
+    font-size: 0.85rem;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  #status.live::before {
+    content: "";
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--signal);
+    margin-right: 0.5rem;
+    vertical-align: 0.1em;
+  }
+  /* --- shell --------------------------------------------------------------
+     Video left, sidebar right. The sidebar is a fixed column so the video
+     never reflows as its contents change; below 60rem it drops underneath. */
+  #shell {
+    flex: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 20rem;
+    min-height: 0;   /* lets the grid shrink instead of pushing the page taller */
+    overflow: hidden;
+  }
+  main {
+    display: grid;
+    place-items: center;
+    padding: 1.25rem;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+  #side {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+    border-left: 1px solid var(--line);
+    background: var(--panel);
+  }
+  /* Stacked. The rows are given explicit shares of the height rather than
+     their natural size, which is what used to overflow: the video takes what
+     it needs up to 45%, the sidebar takes the rest and scrolls internally. */
+  @media (max-width: 60rem) {
+    body.host #shell {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(0, auto) minmax(0, 1fr);
+    }
+    body.host main { padding: 0.75rem; }
+    body.host video { max-height: 45dvh; }
+    #side { border-left: 0; border-top: 1px solid var(--line); }
+  }
+
+  /* --- guests -------------------------------------------------------------
+     A viewer has nothing to administer and nothing to choose: the library,
+     stats, log and account controls are all the host's. So they get the
+     player and nothing else, at whatever size the window allows. The sidebar
+     is not merely hidden — it is removed from the layout, so the grid has one
+     column and the video has the whole width. */
+  body.guest header { display: none; }
+  body.guest #side { display: none; }
+  body.guest #shell { grid-template-columns: 1fr; }
+  body.guest main { padding: 0; }
+  body.guest #stage { max-width: none; }
+  body.guest video { max-width: none; border-radius: 0; }
+
+  /* The player is the whole page for a viewer, so it should grow to the window
+     rather than stop at the file's own pixel size. `width/height: auto` did
+     the latter: a 1920x1080 file sat at 1920x1080 in a 2560px window with a
+     black border around it, and anything smaller than the window stayed
+     postage-stamp sized.
+
+     So the stage is given the pane and an `aspect-ratio` matching the picture,
+     which `--ar` carries from the video's real dimensions. The ratio makes the
+     box letterbox itself: whichever of width/height binds first, the other
+     follows, and `main`'s centring grid absorbs the leftover. The stage is
+     therefore exactly the rendered picture at every window shape — which is
+     what the subtitle canvas is positioned against, so subtitles land on the
+     frame instead of below it. */
+  body.guest #stage {
+    width: 100%;
+    height: 100%;
+    aspect-ratio: var(--ar, 16 / 9);
+    max-width: 100%;
+    max-height: 100%;
+    /* Both must be auto-able for aspect-ratio to letterbox rather than
+       stretch: the binding dimension wins and the other is derived. */
+    margin: auto;
+    line-height: 0;  /* no inline-descender gap under the video */
+  }
+  body.guest video {
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    /* The stage already has the picture's ratio, so contain is a no-op in the
+       steady state — it only matters for the frame or two between a new file
+       loading and --ar being updated, where it prevents a visible stretch. */
+    object-fit: contain;
+  }
+
+  #tabs { display: flex; border-bottom: 1px solid var(--line); }
+  #tabs .tab {
+    flex: 1;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: none;
+    color: var(--dim);
+    padding: 0.65rem 0.4rem;
+    font-size: 0.85rem;
+  }
+  #tabs .tab:hover { color: var(--text); }
+  #tabs .tab.on { color: var(--text); border-bottom-color: var(--signal); }
+  #tabs .count {
+    display: inline-block;
+    margin-left: 0.35rem;
+    padding: 0 0.35em;
+    border-radius: 999px;
+    background: var(--line);
+    font-size: 0.75rem;
+  }
+
+  /* Controls sit above the tabs: they are what the host reaches for, and a
+     scrolling list must never push them off the screen. */
+  #sideTop {
+    padding: 0.75rem;
+    border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  #sideTop #load { width: 100%; }
+  #sideTop #load:disabled { opacity: 0.5; cursor: default; }
+  #sideTop #load:disabled:hover { border-color: var(--line); }
+  #trackRow {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 0.6rem;
+  }
+  #trackRow .track { font-size: 0.78rem; display: flex; gap: 0.3rem; align-items: center; }
+  #trackRow select { max-width: 6.5rem; padding: 0.25rem 0.4rem; font-size: 0.82rem; }
+  #trackRow #accountsBtn { margin-left: auto; padding: 0.3rem 0.55rem; font-size: 0.82rem; }
+  body.guest .admin-only { display: none; }
+
+  #side .panel {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #side .panel[hidden] { display: none; }
+  #side .pad { padding: 0.75rem; }
+  #side .note {
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    color: var(--dim);
+    font-size: 0.8rem;
+  }
+  #filter { width: 100%; box-sizing: border-box; }
+
+  /* --- library list --------------------------------------------------------
+     A list, not a <select>: it can wrap, show the folder, and be searched. */
+  #fileList, #peopleList {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  /* A deep path can be longer than the column is wide. Clamp it to one line
+     and show the tail, which is the part that identifies the folder — the
+     full path is on the title attribute. */
+  #fileList .dir {
+    position: sticky;
+    top: 0;
+    padding: 0.35rem 0.75rem;
+    background: var(--panel);
+    color: var(--dim);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;          /* ellipsis at the start, so the leaf stays */
+    text-align: left;
+  }
+  #fileList .dir span { direction: ltr; unicode-bidi: embed; }
+  #fileList .file {
+    padding: 0.45rem 0.75rem;
+    font-size: 0.88rem;
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    overflow-wrap: anywhere;
+  }
+  #fileList .file:hover { background: var(--ink); }
+  #fileList .file.on {
+    background: var(--ink);
+    border-left-color: var(--signal);
+    color: var(--signal);
+  }
+  #fileList .file:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
+  body.guest #fileList .file { cursor: default; }
+
+  /* --- encode queue --------------------------------------------------------
+     One row per file that needs converting, whatever state it is in: nothing
+     yet, waiting, running, done, failed. Kept in one list rather than split
+     into sections so a file does not jump around the panel as it progresses —
+     the row stays put and its right-hand side changes. */
+  #encodeList {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  #encodeList .enc {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    /* Label takes what is left; the control keeps its natural width so the
+       buttons do not resize as their text changes. */
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.35rem 0.5rem;
+    align-items: center;
+    font-size: 0.85rem;
+  }
+  #encodeList .enc-name { overflow-wrap: anywhere; min-width: 0; }
+  #encodeList .enc-why {
+    grid-column: 1 / -1;
+    font-size: 0.75rem;
+    color: var(--dim);
+    overflow-wrap: anywhere;
+  }
+  #encodeList .enc-why.bad { color: #e06c62; }
+  #encodeList .enc button { padding: 0.25rem 0.6rem; font-size: 0.78rem; }
+  #encodeList .enc-state {
+    font-size: 0.78rem;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  #encodeList .enc-state.done { color: var(--signal); }
+  #encodeList .enc-state.bad { color: #e06c62; }
+  /* The progress bar spans the row under the label, so a long filename does
+     not squeeze it into nothing. */
+  #encodeList .bar {
+    grid-column: 1 / -1;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--line);
+    overflow: hidden;
+  }
+  #encodeList .bar i {
+    display: block;
+    height: 100%;
+    background: var(--signal);
+    transition: width 0.4s linear;
+  }
+  .encode-err {
+    margin: 0 0 0.5rem;
+    color: #e06c62;
+    font-size: 0.8rem;
+  }
+  .encode-foot {
+    border-top: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .encode-foot .note { padding: 0; }
+  .picked { border-top: 1px solid var(--line); }
+  .picked-name {
+    font-size: 0.82rem;
+    color: var(--dim);
+    margin-bottom: 0.5rem;
+    overflow-wrap: anywhere;
+  }
+  #load { width: 100%; }
+
+  /* --- people -------------------------------------------------------------- */
+  #peopleList .person {
+    display: flex;
+    gap: 0.6rem;
+    align-items: start;
+    padding: 0.55rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-top: 0.45rem;
+    flex: 0 0 auto;
+    background: var(--dim);
+  }
+  .dot.good { background: #6a9f5b; }
+  .dot.warn { background: var(--signal); }
+  .dot.bad { background: #c25b57; }
+  .person-main { min-width: 0; flex: 1; }
+  .person-name { font-size: 0.88rem; overflow-wrap: anywhere; }
+  .person-sub { font-size: 0.78rem; color: var(--dim); }
+  .person-sub.good { color: #6a9f5b; }
+  .person-sub.warn { color: var(--signal); }
+  .person-sub.bad { color: #c25b57; }
+  #side .tag {
+    display: inline-block;
+    margin-left: 0.35rem;
+    padding: 0 0.35em;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    font-size: 0.7rem;
+    color: var(--dim);
+  }
+
+  /* --- stats --------------------------------------------------------------- */
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+  .stat {
+    padding: 0.6rem;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--ink);
+  }
+  .stat-label {
+    font-size: 0.72rem;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .stat-value {
+    font-size: 1.15rem;
+    font-variant-numeric: tabular-nums;
+    margin-top: 0.15rem;
+  }
+  .stat-value.good { color: #6a9f5b; }
+  .stat-value.warn { color: var(--signal); }
+  .stat-value.bad { color: #c25b57; }
+
+  /* --- log ----------------------------------------------------------------- */
+  #logView {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    margin: 0;
+    padding: 0.6rem 0.75rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.74rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--dim);
+  }
+  #logView .l-err { color: #c98b88; }
+  #logView .l-join { color: #6a9f5b; }
+  #logView .l-time { color: #5a6070; margin-right: 0.4rem; }
+
+  /* --- notices ------------------------------------------------------------
+     Over the video, top-centre: visible without being in the way, and gone on
+     their own. The disconnect notice is the one that has to be read, so it
+     stays until the state changes. */
+  #notices {
+    position: absolute;
+    top: 0.6rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    align-items: center;
+    pointer-events: none;
+    max-width: 92%;
+  }
+  .notice {
+    padding: 0.35rem 0.8rem;
+    border-radius: 999px;
+    background: rgba(8, 9, 12, 0.88);
+    border: 1px solid var(--line);
+    color: var(--text);
+    font-size: 0.82rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    animation: noticeIn 0.18s ease-out;
+  }
+  .notice.join { border-color: #3d5a36; }
+  .notice.leave { border-color: var(--line); }
+  .notice.drop { border-color: #6c3b39; color: #e0a5a2; }
+  @keyframes noticeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .notice { animation: none; }
+  }
+  /* Bounded by its own pane rather than by the viewport: a dvh figure ignores
+     the header and the sidebar, which is how the page grew a scrollbar.
+     The stage carries the picture's ratio (see #stage), so the element just
+     fills it. */
+  video {
+    width: 100%;
+    height: 100%;
+    background: #000;
+    border-radius: 3px;
+    display: block;
+    object-fit: contain;
+  }
+
+  select, input, button {
+    font: inherit;
+    color: var(--text);
+    background: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0.4rem 0.6rem;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--signal); }
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid var(--signal);
+    outline-offset: 1px;
+  }
+  #hint { color: var(--dim); font-size: 0.85rem; flex: 0 0 auto; }
+  #role { color: var(--dim); font-size: 0.85rem; flex: 0 0 auto; }
+  /* Guests browse the library but cannot start anything, so the play button
+     stays hidden; the list itself is still useful for seeing what's there. */
+  body.guest #load,
+  body.guest #pickedName,
+  body.guest #accountsBtn { display: none; }
+
+  /* --- accounts panel ------------------------------------------------------
+     A dialog rather than a page: managing people is occasional, and it should
+     not cost the host their place in the video. */
+  #accountsBtn .badge {
+    display: inline-block;
+    min-width: 1.1em;
+    margin-left: 0.4rem;
+    padding: 0 0.35em;
+    border-radius: 999px;
+    background: var(--signal);
+    color: var(--ink);
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-align: center;
+  }
+  #accountsBtn .badge[hidden] { display: none; }
+  #accounts {
+    width: min(46rem, 94vw);
+    max-height: 86dvh;
+    padding: 0;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  #accounts::backdrop { background: rgba(4, 5, 8, 0.72); }
+  #accounts header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.9rem 1.1rem;
+    border-bottom: 1px solid var(--line);
+  }
+  #accounts header h2 { margin: 0; font-size: 1rem; flex: 1; }
+  #accounts .body { padding: 1.1rem; overflow-y: auto; max-height: calc(86dvh - 4rem); }
+  #accounts h3 {
+    margin: 0 0 0.6rem;
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--dim);
+  }
+  #accounts section + section { margin-top: 1.6rem; }
+  #accounts table { width: 100%; border-collapse: collapse; }
+  #accounts th {
+    text-align: left;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--dim);
+    padding: 0 0.5rem 0.4rem 0;
+  }
+  #accounts td {
+    padding: 0.45rem 0.5rem 0.45rem 0;
+    border-top: 1px solid var(--line);
+    vertical-align: middle;
+  }
+  #accounts td.actions { text-align: right; white-space: nowrap; }
+  #accounts td.actions button { padding: 0.25rem 0.55rem; font-size: 0.85rem; }
+  #accounts button.danger:hover { border-color: #c25b57; color: #e98b87; }
+  #accounts .empty { color: var(--dim); font-size: 0.9rem; padding: 0.6rem 0; }
+  #accounts .who { font-weight: 600; }
+  #accounts .tag {
+    display: inline-block;
+    margin-left: 0.45rem;
+    padding: 0.05rem 0.4rem;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    font-size: 0.72rem;
+    color: var(--dim);
+  }
+  #accounts .tag.waiting { border-color: var(--signal); color: var(--signal); }
+  #accounts .tag.denied { border-color: #6c3b39; color: #c98b88; }
+  /* The link is the thing to send; the bare code sits under it for anyone who
+     is being told it over voice. */
+  #accounts a.invite {
+    display: block;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.88rem;
+    color: var(--signal);
+    text-decoration: none;
+    word-break: break-all;
+  }
+  #accounts a.invite:hover { text-decoration: underline; }
+  #accounts .code-sub {
+    display: block;
+    margin-top: 0.15rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    color: var(--dim);
+  }
+  #inviteForm {
+    display: flex;
+    align-items: end;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+  }
+  #inviteForm label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.8rem;
+    color: var(--dim);
+  }
+  #inviteForm input { width: 5.5rem; }
+  #accountsErr {
+    margin: 0 0 0.9rem;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid #6c3b39;
+    border-radius: 3px;
+    background: #2a1c1c;
+    font-size: 0.9rem;
+  }
+  #accountsErr[hidden] { display: none; }
+  #path {
+    width: 100%;
+    color: var(--dim);
+    font-size: 0.8rem;
+    overflow-wrap: anywhere;
+    min-height: 1.2em;
+  }
+  #hint.holding { color: var(--signal); }
+
+  /* Autoplay gate. Browsers refuse v.play() until this viewer has interacted
+     with the page, so a guest who just opens the link sees a frozen picture
+     while the host thinks everyone is watching. A footer hint was too easy to
+     miss — this covers the video and cannot be overlooked. */
+  /* The stage is the picture, not the pane: it takes the room available and
+     `aspect-ratio` letterboxes it to the file's shape, so its box and the
+     rendered frame are the same rectangle. That matters because the subtitle
+     canvas and the autoplay gate are both positioned against it — a stage
+     larger than the picture puts subtitles on the black bars, or past the
+     bottom edge where the shell clips them. `--ar` is set from the video's
+     real dimensions on loadedmetadata. */
+  #stage {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    max-width: 1100px;
+    max-height: 100%;
+    aspect-ratio: var(--ar, 16 / 9);
+    margin: auto;
+  }
+  #gate {
+    position: absolute;
+    inset: 0;
+    /* Above the subtitle canvas, which sets a z-index of its own. */
+    z-index: 2;
+    display: none;
+    place-items: center;
+    background: rgba(8, 9, 12, 0.82);
+    border-radius: 3px;
+    cursor: pointer;
+    text-align: center;
+    padding: 1rem;
+  }
+  #gate.show { display: grid; }
+  #gate div { max-width: 22rem; }
+  #gate strong {
+    display: block;
+    font-size: 1.05rem;
+    color: var(--text);
+    margin-bottom: 0.35rem;
+  }
+  #gate span { font-size: 0.85rem; color: var(--dim); }
+  #gate .play {
+    width: 62px; height: 62px;
+    border-radius: 50%;
+    border: 2px solid var(--signal);
+    margin: 0 auto 0.9rem;
+    display: grid;
+    place-items: center;
+  }
+  #gate .play::after {
+    content: "";
+    border-left: 18px solid var(--signal);
+    border-top: 11px solid transparent;
+    border-bottom: 11px solid transparent;
+    margin-left: 5px;
+  }
+  #gate:hover .play { background: rgba(216, 166, 87, 0.12); }
+
+  /* Debug panel: ?debug=1. Guests can't be talked through devtools, so the
+     same log they'd find there is put on the page. */
+  #debug {
+    display: none;
+    font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+    background: #0a0b0e;
+    border-top: 1px solid var(--line);
+    color: var(--dim);
+    max-height: 12rem;
+    overflow-y: auto;
+    padding: 0.5rem 1.25rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  body.debug #debug { display: block; }
+  #debug b { color: var(--signal); font-weight: 500; }
+  #debug .err { color: #e06c62; }
+  .track {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--dim);
+    font-size: 0.85rem;
+    flex: 0 0 auto;
+  }
+  .track select { max-width: 12rem; }
+  .track[hidden] { display: none; }
+  /* Guests see which tracks are playing but can't change them. */
+  body.guest .track select { pointer-events: none; opacity: 0.65; }
+  /* Only used on the WebVTT fallback path — when libass is doing the work it
+     paints the canvas below and no cues exist to style. */
+  video::cue {
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 0.9em;
+  }
+  /* libass output. Sized to the video's rendered box, not the stage: a 16:9
+     video in a wider stage is letterboxed, and subtitles belong on the picture
+     rather than on the black bars beside it. */
+  #subs {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    display: block;
+    /* Above the picture, below the click-to-join overlay. */
+    z-index: 1;
+  }
+  #subs[hidden] { display: none; }
+
+  /* Fullscreen. The browser's own button on the <video> takes the element
+     alone full screen, and the subtitle canvas — a sibling, not a child — is
+     left behind on the page underneath, so subtitles disappear exactly when
+     someone wants them most. So the stage is what goes fullscreen, and it
+     carries the canvas and the autoplay gate with it.
+
+     Inside fullscreen the stage is the screen, so its max-width and the
+     centring margins have to come off, and the ratio still letterboxes the
+     picture within it. */
+  #stage:fullscreen {
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    aspect-ratio: auto;
+    background: #000;
+    display: grid;
+    place-items: center;
+  }
+  /* Re-letterbox inside the fullscreen box: the video keeps the file's shape
+     and the black bars are the stage's background. The canvas is positioned
+     against the stage and jassub measures the video, so both stay aligned. */
+  #stage:fullscreen video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    border-radius: 0;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "jassub": "/vendor/jassub/dist/jassub.js",
+    "rvfc-polyfill": "/vendor/rvfc-polyfill/index.js",
+    "abslink": "/vendor/abslink/src/abslink.js",
+    "abslink/w3c": "/vendor/abslink/adapters/w3c.js",
+    "lfa-ponyfill": "/vendor/lfa-ponyfill/index.js",
+    "throughput": "/vendor/throughput.js"
+  }
+}
+</script>
+</head>
+<!-- Starts as a guest: the sidebar appears only once the server confirms this
+     session is an admin, so a viewer never sees it flash on load. -->
+<body class="guest">
+
+<header>
+  <h1>Watch together</h1>
+  <span id="now"></span>
+  <span id="hint"></span>
+  <span id="viewers"></span>
+  <span id="role"></span>
+  <span id="status">connecting</span>
+</header>
+
+<div id="shell">
+  <main>
+    <div id="stage">
+      <video id="v" controls playsinline></video>
+      <canvas id="subs" hidden></canvas>
+      <div id="notices" aria-live="polite"></div>
+      <div id="gate">
+        <div>
+          <div class="play"></div>
+          <strong>Click to join</strong>
+          <span id="gateWhy">Your browser needs a click before it will start playing.</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <aside id="side">
+    <!-- Controls first: these are what the host reaches for, and they should
+         not be at the bottom of a scrolling list. -->
+    <div id="sideTop">
+      <button id="load" type="button" disabled>Play this for everyone</button>
+      <div class="picked-name" id="pickedName">Pick a file below</div>
+      <div id="trackRow">
+        <label class="track" id="audioWrap" hidden>audio
+          <select id="audioSel"></select>
+        </label>
+        <label class="track" id="subWrap" hidden>subs
+          <select id="subSel"></select>
+        </label>
+        <button id="accountsBtn" type="button" title="Invites and people">
+          Accounts<span class="badge" id="pendingBadge" hidden>0</span>
+        </button>
+      </div>
+    </div>
+
+    <nav id="tabs">
+      <button type="button" class="tab on" data-panel="libraryPanel">Library</button>
+      <button type="button" class="tab" data-panel="peoplePanel">
+        People<span class="count" id="peopleCount">0</span>
+      </button>
+      <button type="button" class="tab admin-only" data-panel="encodePanel">
+        Encode<span class="count" id="encodeCount" hidden>0</span>
+      </button>
+      <button type="button" class="tab" data-panel="statsPanel">Stats</button>
+      <button type="button" class="tab admin-only" data-panel="logPanel">Log</button>
+    </nav>
+
+    <section id="libraryPanel" class="panel">
+      <div class="pad">
+        <input id="filter" type="search" placeholder="Search the library…" autocomplete="off">
+      </div>
+      <ul id="fileList"></ul>
+      <p class="note" id="fileNote"></p>
+    </section>
+
+    <section id="peoplePanel" class="panel" hidden>
+      <ul id="peopleList"></ul>
+      <p class="note" id="peopleNote"></p>
+    </section>
+
+    <!-- Files a browser cannot decode are converted here, ahead of time,
+         rather than during playback. The list is everything in the library
+         that needs it, plus whatever is queued or already done. -->
+    <section id="encodePanel" class="panel" hidden>
+      <div class="pad">
+        <p class="note" id="encodeNote">Checking the library…</p>
+        <p id="encodeErr" class="encode-err" hidden></p>
+      </div>
+      <ul id="encodeList"></ul>
+      <div class="pad encode-foot">
+        <span id="encodeDisk" class="note"></span>
+        <button id="encodeClear" type="button" hidden>Clear finished</button>
+      </div>
+    </section>
+
+    <section id="statsPanel" class="panel" hidden>
+      <div class="pad">
+        <div class="stat-grid" id="serverStats"></div>
+        <p class="note" id="statsNote">Waiting for the first sample…</p>
+      </div>
+    </section>
+
+    <section id="logPanel" class="panel" hidden>
+      <pre id="logView"></pre>
+      <p class="note" id="logNote"></p>
+    </section>
+  </aside>
+</div>
+
+<dialog id="accounts">
+  <header>
+    <h2>Accounts</h2>
+    <button id="accountsClose" type="button">Close</button>
+  </header>
+  <div class="body">
+    <p id="accountsErr" hidden></p>
+
+    <section>
+      <h3>Invite someone</h3>
+      <form id="inviteForm">
+        <label>uses
+          <input id="inviteUses" type="number" min="1" max="50" value="5">
+        </label>
+        <label>expires in (days, 0 = never)
+          <input id="inviteDays" type="number" min="0" max="365" value="0">
+        </label>
+        <button type="submit">Create code</button>
+      </form>
+      <table>
+        <thead>
+          <tr><th>Invite link</th><th>Uses left</th><th>Expires</th><th></th></tr>
+        </thead>
+        <tbody id="inviteRows"></tbody>
+      </table>
+      <p class="empty" id="invitesEmpty">No active codes. Create one to let someone register.</p>
+    </section>
+
+    <section>
+      <h3>People</h3>
+      <table>
+        <thead>
+          <tr><th>User</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="userRows"></tbody>
+      </table>
+    </section>
+  </div>
+</dialog>
+
+<pre id="debug"></pre>
+
+<script>
+const qs = new URLSearchParams(location.search);
+const room = qs.get('room') || 'main';
+const v = document.getElementById('v');
+const statusEl = document.getElementById('status');
+const viewersEl = document.getElementById('viewers');
+const nowEl = document.getElementById('now');
+const hintEl = document.getElementById('hint');
+const roleEl = document.getElementById('role');
+const audioSel = document.getElementById('audioSel');
+const subSel = document.getElementById('subSel');
+const audioWrap = document.getElementById('audioWrap');
+const subWrap = document.getElementById('subWrap');
+const gate = document.getElementById('gate');
+const gateWhy = document.getElementById('gateWhy');
+const debugEl = document.getElementById('debug');
+
+// --- logging -----------------------------------------------------------------
+// ?debug=1 shows a log panel under the player. Anything marked important is
+// also sent to the server, so the host sees guests' failures on their own
+// console instead of having to ask what went wrong.
+const DEBUG = qs.get('debug') === '1';
+if (DEBUG) document.body.classList.add('debug');
+
+const startedAt = Date.now();
+function stamp() {
+  return ((Date.now() - startedAt) / 1000).toFixed(2).padStart(7, ' ');
+}
+
+function dbg(text, { err = false, toServer = false } = {}) {
+  if (DEBUG) {
+    const line = document.createElement('span');
+    line.textContent = `${stamp()}  ${text}
+`;
+    if (err) line.className = 'err';
+    debugEl.appendChild(line);
+    // Only autoscroll if they haven't scrolled up to read something.
+    const atBottom = debugEl.scrollHeight - debugEl.scrollTop - debugEl.clientHeight < 40;
+    if (atBottom) debugEl.scrollTop = debugEl.scrollHeight;
+    while (debugEl.childElementCount > 400) debugEl.firstChild.remove();
+  }
+  if (err) console.warn('[watch]', text);
+  else if (DEBUG) console.log('[watch]', text);
+  if (toServer && ws?.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'log', text }));
+  }
+}
+
+
+let offset = 0;        // serverNow - clientNow, in ms
+let lastRtt = null;    // most recent round-trip, reported for the sidebar
+let clockReady = false; // true once we have measured the offset at least once
+let applying = false;  // suppresses echo while we apply a remote state
+let state = null;
+let loaded = null;     // id of the file currently in the <video>
+let applyTimer = null;
+let joinedAt = Date.now();
+let isHost = false;
+let ws;
+let clockTimer = null;
+let sessionLost = false;
+let reconnectAttempts = 0;
+
+// The session ended — expired, revoked, or the account was denied. Stop
+// reconnecting and say so plainly, rather than sitting on "reconnecting"
+// forever or yanking the tab away mid-session.
+function showSessionLost() {
+  if (sessionLost) return;
+  sessionLost = true;
+  clearInterval(clockTimer);
+  v.pause();
+  statusEl.textContent = 'signed out';
+  statusEl.className = '';
+  gateWhy.innerHTML =
+    'Your session ended. <a href="/login" style="color:#5b8cff">Sign in again</a> to keep watching.';
+  gate.querySelector('strong').textContent = 'Session ended';
+  gate.classList.add('show');
+  gate.style.pointerEvents = 'auto';
+  dbg('session ended — not reconnecting', { err: true });
+}
+
+// A rejected handshake surfaces as an error followed by a close with no code,
+// so a run of immediately-failing connections is the signal. Checking /healthz
+// distinguishes "server is down" from "you are signed out".
+async function diagnoseFailure() {
+  try {
+    const r = await fetch('/list', { headers: { accept: 'application/json' } });
+    if (r.status === 401 || r.status === 403) {
+      showSessionLost();
+      return true;
+    }
+  } catch {
+    // Network is down, not the session. Keep retrying.
+  }
+  return false;
+}
+
+// The session cookie authenticates the socket, so nothing goes in the URL.
+// Identity and role come back from the server in the first state message.
+function connect() {
+  if (sessionLost) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/?room=${encodeURIComponent(room)}`);
+
+  ws.onopen = () => {
+    dbg('websocket open');
+    reconnectAttempts = 0;
+    statusEl.textContent = 'synced';
+    statusEl.className = 'live';
+    // Samples from the previous connection measured a path that no longer
+    // exists; keeping them can pin the offset to a stale best-case reading.
+    clockSamples = [];
+    clockReady = false;
+    measureClockBurst();
+    // Guard against stacking an interval per reconnect — the old code added a
+    // new one on every open and never cleared it.
+    //
+    // Five seconds rather than fifteen: this is also what keeps the socket
+    // alive through the tunnel, and three samples a minute is not enough to
+    // notice a clock that has walked.
+    clearInterval(clockTimer);
+    clockTimer = setInterval(measureClock, 5000);
+  };
+
+  ws.onclose = async (e) => {
+    clearInterval(clockTimer);
+    // Our own link to the room is gone, so nothing arriving can be trusted to
+    // keep us in sync. Stop rather than drift on alone — and say why, because
+    // a video that simply halts looks like a broken file.
+    if (!v.paused) {
+      v.pause();
+      notice('Paused — lost connection to the server', 'drop');
+    }
+    if (sessionLost) return;
+    // A handshake the server refused closes immediately with no useful code.
+    // After two such failures, ask an HTTP endpoint what is actually wrong.
+    reconnectAttempts++;
+    if (reconnectAttempts >= 2 && (await diagnoseFailure())) return;
+    dbg(`websocket closed (${e.code || 'no code'}) — reconnecting in 1.5s`, { err: true });
+    statusEl.textContent = 'reconnecting';
+    statusEl.className = '';
+    setTimeout(connect, 1500);
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'pong') {
+      const rtt = Date.now() - msg.t;
+      lastRtt = rtt;
+      recordClockSample(rtt, msg.serverNow);
+      return;
+    }
+    if (msg.type === 'viewers') {
+      viewersEl.textContent = `${msg.viewers} watching`;
+      return;
+    }
+    if (msg.type === 'notice') {
+      notice(msg.text, msg.kind);
+      return;
+    }
+    if (msg.type === 'log') {
+      renderLog(msg.lines || [], false);
+      return;
+    }
+    if (msg.type === 'logline') {
+      renderLog([msg.entry], true);
+      return;
+    }
+    if (msg.type === 'stats') {
+      renderPeople(msg.clients || []);
+      renderServerStats(msg.server);
+      return;
+    }
+    if (msg.type === 'admin') {
+      adminData = { users: msg.users || [], invites: msg.invites || [] };
+      renderAccounts();
+      return;
+    }
+    if (msg.type === 'admin:error') {
+      accountsErr.textContent = msg.error;
+      accountsErr.hidden = false;
+      return;
+    }
+    if (msg.type === 'encode') {
+      // A file that just finished is now playable directly, and /list carries
+      // that flag — so the library's copy is stale the moment a done row
+      // appears. Re-read it once per completion rather than on every progress
+      // tick, which arrive several times a second.
+      const wasDone = new Set(
+        (encodeData.items || []).filter((i) => i.status === 'done').map((i) => i.id)
+      );
+      const newlyDone = (msg.items || []).some((i) => i.status === 'done' && !wasDone.has(i.id));
+      encodeData = msg;
+      if (newlyDone) {
+        // The probe's `cached` flag changed too, so drop what we remembered.
+        if (tracksFor && msg.items.some((i) => i.status === 'done' && i.id === tracksFor)) {
+          tracksFor = null;
+        }
+        loadLibrary();
+      } else {
+        renderEncode();
+      }
+      return;
+    }
+    if (msg.type === 'encode:error') {
+      encodeErr.textContent = msg.error;
+      encodeErr.hidden = false;
+      clearTimeout(encodeErrTimer);
+      encodeErrTimer = setTimeout(() => { encodeErr.hidden = true; }, 6000);
+      return;
+    }
+    if (msg.type === 'revoked') {
+      // The server is about to close this socket. Say why, so it doesn't look
+      // like a network problem the client should retry.
+      showSessionLost();
+      return;
+    }
+    if (msg.type === 'state') {
+      dbg(
+        `state: ${msg.paused ? 'paused' : 'playing'} @ ${(+msg.time).toFixed(2)}s` +
+          `  viewers=${msg.viewers}` +
+          (msg.by ? `  by ${msg.by}` : '') +
+          (msg.waitingFor?.length ? `  waiting for ${msg.waitingFor.join(', ')}` : '')
+      );
+      if (msg.you) setRole(msg.you.host);
+      apply(msg);
+    }
+  };
+}
+
+function setRole(host) {
+  isHost = host;
+  document.body.classList.toggle('guest', !host);
+  // Both classes exist so layout rules can target either without relying on
+  // :not(), which reads badly inside a media query.
+  document.body.classList.toggle('host', host);
+  roleEl.textContent = host ? 'you control playback' : 'the host controls playback';
+  // Guests keep volume, fullscreen and captions; they just can't drive.
+  v.controlsList = host ? '' : 'nodownload noplaybackrate';
+}
+
+// --- clock -------------------------------------------------------------------
+// Every sync decision is made against `offset`, so a bad estimate of it shows
+// up as the whole room being wrong together. One sample is not an estimate: a
+// single round trip that happened to queue behind a video segment moves the
+// figure by however long that took, and the old code took the newest sample as
+// the truth every fifteen seconds.
+//
+// So samples are kept and the one with the *lowest* round trip wins. That is
+// the standard trick from NTP and it is the right one here: latency can only
+// ever be added to a packet, never subtracted, so the quickest exchange we
+// have seen is the least contaminated, and its midpoint is the closest we can
+// get to the server's clock. A median would average in the delays instead.
+
+const CLOCK_SAMPLES = 8;
+let clockSamples = [];   // { rtt, offset }
+
+function recordClockSample(rtt, serverNow) {
+  // A round trip long enough to span a frame of video tells us nothing about
+  // the clock; keeping it only risks it being the best of a bad set later.
+  if (!Number.isFinite(rtt) || rtt < 0 || rtt > 10000) return;
+  clockSamples.push({ rtt, offset: serverNow + rtt / 2 - Date.now() });
+  if (clockSamples.length > CLOCK_SAMPLES) clockSamples.shift();
+
+  const best = clockSamples.reduce((a, b) => (b.rtt < a.rtt ? b : a));
+  const moved = Math.abs(best.offset - offset);
+  offset = best.offset;
+  if (!clockReady) {
+    clockReady = true;
+    dbg(`clock: offset ${offset.toFixed(0)}ms (rtt ${best.rtt}ms)`);
+  } else if (moved > 50) {
+    dbg(`clock: offset ${offset.toFixed(0)}ms (rtt ${best.rtt}ms, moved ${moved.toFixed(0)}ms)`);
+  }
+}
+
+function measureClock() {
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+}
+
+// On a fresh connection we have no estimate at all, and the drift loop refuses
+// to act until we do — so getting a handful of samples quickly matters more
+// than being tidy about it. Spread over a couple of seconds so they are
+// genuinely independent rather than four packets in one burst.
+let clockBurstTimer = null;
+function measureClockBurst(n = 5) {
+  clearInterval(clockBurstTimer);
+  let left = n;
+  measureClock();
+  clockBurstTimer = setInterval(() => {
+    if (--left <= 0 || !ws || ws.readyState !== 1) {
+      clearInterval(clockBurstTimer);
+      return;
+    }
+    measureClock();
+  }, 400);
+}
+
+// Where the room should be right now, translated into our own clock.
+function targetTime() {
+  if (!state) return 0;
+  if (state.paused) return state.time;
+  const elapsed = (Date.now() + offset - state.serverNow) / 1000;
+  return state.time + elapsed;
+}
+
+// --- autoplay ----------------------------------------------------------------
+// A browser will not start playback with sound until this viewer has
+// interacted with the page. Guests therefore sit on a frozen frame while the
+// host sees "N watching" and assumes everyone is fine.
+//
+// Two-step fallback: try with sound, and if that is refused retry muted, which
+// browsers do allow. The picture then moves for everyone and the overlay only
+// has to ask for a click to restore sound — far better than a dead video.
+
+let gateReason = '';
+
+function showGate(why) {
+  gateReason = why;
+  gateWhy.textContent = why;
+  gate.classList.add('show');
+}
+
+function hideGate() {
+  gate.classList.remove('show');
+  gateReason = '';
+}
+
+// True once we've had to mute this viewer to get playback started. Tracked
+// separately from v.muted, which the viewer may also change themselves.
+let mutedByUs = false;
+
+async function tryPlay() {
+  // Already playing and audible — nothing to do. Re-entering here on every
+  // state message is normal, so this is the common case.
+  if (!v.paused && !v.muted) {
+    hideGate();
+    return true;
+  }
+
+  if (!mutedByUs) {
+    try {
+      await v.play();
+      if (!v.muted) hideGate();
+      dbg('play() ok');
+      return true;
+    } catch (e) {
+      dbg(`play() refused: ${e.name} — ${e.message}`, { err: true });
+    }
+  }
+
+  // Refused with sound. Muted autoplay is normally permitted, and a moving
+  // picture with no sound beats a frozen frame.
+  //
+  // The overlay goes up *before* the await, not after: v.play() can stay
+  // pending for a long time while the file buffers, and a viewer staring at a
+  // silent video is exactly who this message is for. If the play is refused
+  // outright we fall through and replace the message below.
+  try {
+    mutedByUs = true;
+    v.muted = true;
+    showGate('Playing without sound — click anywhere to unmute.');
+    dbg('trying muted playback', { toServer: true });
+    await v.play();
+    dbg('playing muted — waiting for a click to unmute');
+    return true;
+  } catch (e) {
+    dbg(`muted play() also refused: ${e.name}`, { err: true });
+  }
+
+  // Refused outright: nothing plays until they click.
+  mutedByUs = false;
+  v.muted = false;
+  showGate('Your browser needs a click before it will start playing.');
+  dbg('autoplay blocked — nothing will play until this viewer clicks', {
+    err: true,
+    toServer: true,
+  });
+  return false;
+}
+
+// Any click on the overlay is the interaction the browser was waiting for.
+gate.addEventListener('click', async () => {
+  mutedByUs = false;
+  v.muted = false;
+  hideGate();
+  dbg('viewer clicked the overlay — unmuting');
+  if (state && !state.paused) {
+    seekInFile(targetTime());
+    const ok = await tryPlay();
+    if (!ok) showGate('Still blocked — press the play button in the video controls.');
+  }
+});
+
+// If they unmute via the native controls, the overlay has done its job.
+v.addEventListener('volumechange', () => {
+  if (!v.muted && mutedByUs) {
+    mutedByUs = false;
+    hideGate();
+    dbg('viewer unmuted');
+  }
+});
+
+async function apply(msg) {
+  state = msg;
+  viewersEl.textContent = `${msg.viewers} watching`;
+  hintEl.textContent = msg.waitingFor.length ? `waiting for ${msg.waitingFor.join(', ')}` : '';
+  hintEl.className = msg.waitingFor.length ? 'holding' : '';
+
+  if (msg.src && msg.src !== loaded) {
+    loaded = msg.src;
+    joinedAt = Date.now();
+    // Direct play first. loadTracks reports whether this browser can actually
+    // decode the file, and switches to the converted copy if it cannot.
+    v.src = '/media/' + msg.src;
+    document.title = msg.label + ' — Watch together';
+    nowEl.textContent = msg.label || '';
+    nowEl.title = msg.label || '';
+    v.querySelectorAll('track').forEach((t) => t.remove());
+    destroyJassub();
+    dbg(`loading ${msg.label} (${msg.src})`);
+    loadTracks(msg.src);
+  }
+
+  // Track choice is room state like everything else.
+  //
+  // Re-asserted on every state message rather than only when the numbers
+  // change. The old guard meant a renderer that had been torn down — by a
+  // reconnect, a source swap, or a failed start — was never rebuilt, because
+  // the room's choice still matched ours and nothing asked for it again.
+  // applyTracks is idempotent: startJassub returns early when the live
+  // renderer is already the one being asked for.
+  if (Number.isInteger(msg.audio) && Number.isInteger(msg.sub)) {
+    wantAudio = msg.audio;
+    wantSub = msg.sub;
+    applyTracks();
+  }
+
+  // Release the echo guard on a timer, never on the promise. v.play() can
+  // stay pending indefinitely while buffering, and latching `applying` that
+  // long would silently swallow this viewer's own play/pause.
+  applying = true;
+  clearTimeout(applyTimer);
+  applyTimer = setTimeout(() => { applying = false; }, 300);
+
+  // Snap to the room when the gap is too big to nudge away, and leave
+  // anything smaller to the drift loop, which closes it with playbackRate
+  // instead of a jump. The old 0.75s threshold seeked on every state message
+  // that disagreed by more than that — and with the host now heart-beating,
+  // state messages are frequent, so a viewer sitting a second out would have
+  // been yanked repeatedly rather than eased back once.
+  //
+  // The host is exempt: they are the reference, and seeking them to a figure
+  // derived from their own last report is how a small reading error becomes a
+  // visible jump in the film they are hosting.
+  const target = targetTime();
+  if (!isHost && Math.abs(posInFile() - target) > HARD_SEEK) seekInFile(target);
+
+  if (msg.paused) {
+    v.pause();
+    // Paused is an exact anchor, so it is the one moment worth landing on
+    // precisely — there is no rate to nudge with while stopped.
+    if (!isHost && Math.abs(posInFile() - target) > 0.25) seekInFile(target);
+    // Don't nag about autoplay while the room is paused anyway.
+    if (gateReason.startsWith('Your browser needs')) hideGate();
+  } else {
+    tryPlay();
+  }
+}
+
+// --- audio and subtitle tracks -----------------------------------------------
+// Both selections live in room state, so everyone hears the same dub and reads
+// the same subs. Only the host can change them.
+
+let tracks = { audio: [], subs: [] };
+let tracksFor = null;   // which file id `tracks` describes
+let wantAudio = 0, wantSub = -1;
+
+async function loadTracks(id) {
+  if (tracksFor === id) return;
+  tracksFor = id;
+  tracks = { audio: [], subs: [] };
+  try {
+    tracks = await fetch('/tracks/' + id).then((r) => r.json());
+  } catch {
+    // ffprobe missing or the probe failed — just hide the pickers.
+  }
+  if (tracksFor !== id) return; // a different file loaded while we waited
+  dbg(`tracks: ${tracks.audio.length} audio, ${tracks.subs.length} subtitle`);
+  fillTrackMenus();
+
+  // The server has read this file's codecs; if nothing in this browser can
+  // decode it, switch to the converted copy rather than letting the decoder
+  // fail with a misleading "network error".
+  if (tracks.play && !tracks.play.ok) useEncoded(id, tracks.play.reasons);
+
+  applyTracks();
+}
+
+// --- encoded files -----------------------------------------------------------
+// Some files no browser can play: HEVC is the usual one, and 10-bit and exotic
+// audio codecs follow. Those are converted ahead of time from the host's
+// Encode panel, and this is where the player picks the converted copy up.
+//
+// It used to encode on demand instead, streaming a fragmented MP4 while the
+// real file built in the background. That pipe has no index, so the browser
+// could not seek in it: every seek restarted ffmpeg, and the client grew a
+// substitute scrub bar, a substitute clock, and a subtitle time offset to
+// hide the fact. All of that is gone. A converted file is an ordinary MP4 —
+// byte ranges, a real duration, the browser's own controls — and one that has
+// not been converted yet simply says so.
+
+// Swap to the converted copy, or explain why we cannot.
+function useEncoded(id, reasons) {
+  const why = reasons?.[0]?.text || 'This file needs converting for the browser';
+
+  if (tracks.cached) {
+    dbg(`playing the converted copy (${why})`);
+    v.src = `/transcode/${id}`;
+    v.controls = true;
+    return;
+  }
+
+  // Nothing to play. Saying so beats letting the decoder fail, which surfaces
+  // as "network error" and sends everyone debugging the tunnel.
+  dbg(`not converted yet: ${why}`, { err: true, toServer: true });
+  v.removeAttribute('src');
+  v.load();
+  hintEl.textContent = 'not converted yet';
+  hintEl.className = 'holding';
+  if (isHost) {
+    notice(`${why}. Queue it in the Encode tab, then play it again.`, 'drop');
+  } else {
+    notice('This file has not been converted for the browser yet — ask the host.', 'drop');
+  }
+}
+
+// Where we are in the source. Direct play and a converted file both map
+// straight onto the element; the offset survives only so the subtitle
+// renderer has one place to ask.
+function posInFile() {
+  return v.currentTime;
+}
+
+function seekInFile(to) {
+  v.currentTime = to;
+}
+
+function fillTrackMenus() {
+  audioSel.innerHTML = '';
+  tracks.audio.forEach((t, i) => {
+    audioSel.add(new Option(t.label, String(i)));
+  });
+  // One track is no choice at all.
+  audioWrap.hidden = tracks.audio.length < 2;
+
+  subSel.innerHTML = '';
+  subSel.add(new Option('off', '-1'));
+  tracks.subs.forEach((t, i) => {
+    subSel.add(new Option(t.label, String(i)));
+  });
+  subWrap.hidden = tracks.subs.length === 0;
+}
+
+// --- libass ------------------------------------------------------------------
+// ffmpeg's webvtt muxer keeps timing and line breaks and discards everything
+// else: font, size, colour, outline, border style, position. Styled subtitles
+// come out as plain white-on-black and every track looks the same.
+//
+// So when the server has jassub available we fetch the raw ASS instead and
+// render it with libass (the same library mpv uses), on a canvas over the
+// video. JASSUB takes the <video> directly and handles its own sizing and
+// frame sync, so there is nothing to keep in step here.
+
+// JASSUB hands the canvas to its worker with transferControlToOffscreen, and a
+// canvas can only be transferred once — ever. So the element is replaced rather
+// than reused whenever a renderer starts, and the old one is thrown away with
+// the renderer that owned it.
+let subsCanvas = document.getElementById('subs');
+
+function freshCanvas() {
+  const next = subsCanvas.cloneNode(false);
+  subsCanvas.replaceWith(next);
+  subsCanvas = next;
+  return next;
+}
+
+let jassub = null;        // the live renderer, or null
+let jassubMod = null;     // the imported module, fetched once
+let jassubFor = null;     // 'id:n' currently rendered, so repeats are no-ops
+let jassubBroken = false; // give up quietly and leave WebVTT to it
+
+// Unpack the font blob: repeated [u32 name length][name][u32 data length][data].
+function unpackFonts(buf) {
+  const view = new DataView(buf);
+  const out = {};
+  let at = 0;
+  while (at + 8 <= buf.byteLength) {
+    const nameLen = view.getUint32(at);
+    at += 4;
+    if (at + nameLen + 4 > buf.byteLength) break;
+    const name = new TextDecoder().decode(new Uint8Array(buf, at, nameLen));
+    at += nameLen;
+    const dataLen = view.getUint32(at);
+    at += 4;
+    if (at + dataLen > buf.byteLength) break;
+    out[name] = new Uint8Array(buf.slice(at, at + dataLen));
+    at += dataLen;
+  }
+  return out;
+}
+
+function destroyJassub() {
+  if (jassub) {
+    try { jassub.destroy(); } catch {}
+    jassub = null;
+  }
+  jassubFor = null;
+  subsCanvas.hidden = true;
+}
+
+async function startJassub(id, n, label) {
+  const key = `${id}:${n}`;
+  if (jassubFor === key) return true;
+  if (jassubBroken) return false;
+
+  try {
+    if (!jassubMod) jassubMod = (await import('jassub')).default;
+    // The file may have changed while the module loaded.
+    if (loaded !== id || wantSub !== n) return true;
+
+    destroyJassub();
+
+    // Fonts attached to the container. Missing ones are not fatal — libass
+    // substitutes — so a failure here still renders, just with wrong metrics.
+    let availableFonts;
+    try {
+      const buf = await fetch(`/fonts/${id}.bin`).then((r) => r.arrayBuffer());
+      if (buf.byteLength) {
+        availableFonts = unpackFonts(buf);
+        dbg(`libass: ${Object.keys(availableFonts).length} embedded font(s)`);
+      }
+    } catch {
+      dbg('libass: no embedded fonts', { err: true });
+    }
+    if (loaded !== id || wantSub !== n) return true;
+
+    const canvas = freshCanvas();
+    jassub = new jassubMod({
+      video: v,
+      canvas,
+      subUrl: `/subs/${id}/${n}.ass`,
+      // No workerUrl: jassub resolves its own worker relative to the module,
+      // which is the abslink entry point in dist/worker/. The file under
+      // dist/wasm/ with a similar name is the emscripten module it imports,
+      // and pointing at that one loads a worker that never answers.
+      wasmUrl: '/vendor/jassub/dist/wasm/jassub-worker.wasm',
+      modernWasmUrl: '/vendor/jassub/dist/wasm/jassub-worker-modern.wasm',
+      fonts: ['/vendor/jassub/dist/default.woff2'],
+      availableFonts,
+      // Asking the OS for fonts needs a permission prompt in some browsers,
+      // and a guest clicking through a dialog to watch a video is a bad trade.
+      queryFonts: false,
+      // Both the source and its converted copy run on the same clock as the
+      // media element — the converted file starts at zero of the film, not at
+      // a seek offset — so libass needs no correction. This was not true while
+      // encoding happened during playback, which is what the offset was for.
+      timeOffset: 0,
+    });
+    jassubFor = key;
+    canvas.hidden = false;
+    dbg(`libass rendering ${label}`);
+
+    // The canvas starts at its default 300x150. jassub sizes it from its own
+    // ResizeObserver, which does not fire when the video has not changed size
+    // since the previous renderer watched it — so on every track change after
+    // the first the overlay would stay tiny. Size it once explicitly instead.
+    jassub.ready
+      .then(() => jassub && jassub.resize())
+      .catch((e) => dbg(`libass resize failed: ${e.message}`, { err: true }));
+    return true;
+  } catch (e) {
+    // One failure is enough: fall back for the rest of the session rather than
+    // retrying the same broken import on every track change.
+    jassubBroken = true;
+    destroyJassub();
+    dbg(`libass unavailable, using WebVTT: ${e.message}`, { err: true, toServer: true });
+    return false;
+  }
+}
+
+// Put the <track> elements in place and enable the chosen one.
+function applyTracks() {
+  if (!loaded) return;
+
+  audioSel.value = String(wantAudio);
+  subSel.value = String(wantSub);
+
+  // Subtitles. Two renderers: libass for ASS/SSA, which is the whole point of
+  // the canvas overlay, and the browser's own <track> for everything else.
+  // Exactly one of them is live at a time.
+  const want = tracks.subs[wantSub];
+  const isAss = !!want && /ass|ssa/.test(want.codec || '');
+  const useLibass = isAss && tracks.libass && !jassubBroken;
+
+  if (useLibass) {
+    // Drop any WebVTT cues first so the two can't both paint.
+    v.querySelectorAll('track').forEach((t) => t.remove());
+    for (const t of v.textTracks) t.mode = 'disabled';
+    const id = loaded;
+    const n = wantSub;
+    startJassub(id, n, want.label).then((ok) => {
+      // libass failed and this is still the current choice: fall back.
+      if (!ok && loaded === id && wantSub === n) applyTracks();
+    });
+    return;
+  }
+
+  destroyJassub();
+
+  const wantSrc = want ? `/subs/${loaded}/${wantSub}.vtt` : null;
+  const existing = [...v.querySelectorAll('track')];
+  if (!wantSrc) {
+    existing.forEach((t) => t.remove());
+  } else if (!existing.some((t) => t.getAttribute('src') === wantSrc)) {
+    existing.forEach((t) => t.remove());
+    const el = document.createElement('track');
+    el.kind = 'subtitles';
+    el.label = want.label;
+    if (want.lang) el.srclang = want.lang;
+    el.src = wantSrc;
+    el.default = true;
+    v.appendChild(el);
+  }
+  // Setting .default alone isn't enough once the element is live.
+  for (const t of v.textTracks) t.mode = wantSrc ? 'showing' : 'disabled';
+
+  // Audio: browsers that implement audioTracks (Safari) can switch natively.
+  // Chrome and Firefox don't, so there the choice only takes effect for files
+  // prepped with a single audio track. Reflected either way so the room agrees.
+  if (v.audioTracks && v.audioTracks.length > 1) {
+    for (let i = 0; i < v.audioTracks.length; i++) v.audioTracks[i].enabled = i === wantAudio;
+  }
+}
+
+audioSel.onchange = () => {
+  if (!isHost) return;
+  wantAudio = parseInt(audioSel.value, 10);
+  ws.send(JSON.stringify({ type: 'tracks', audio: wantAudio }));
+  applyTracks();
+};
+
+subSel.onchange = () => {
+  if (!isHost) return;
+  wantSub = parseInt(subSel.value, 10);
+  ws.send(JSON.stringify({ type: 'tracks', sub: wantSub }));
+  applyTracks();
+};
+
+// --- accounts panel ----------------------------------------------------------
+// Everything here runs over the same WebSocket as playback. The server checks
+// admin rights on every message, so this UI is a convenience, not the guard —
+// a guest who unhides the button still gets nowhere.
+
+const accountsBtn = document.getElementById('accountsBtn');
+const accountsDlg = document.getElementById('accounts');
+const accountsErr = document.getElementById('accountsErr');
+const pendingBadge = document.getElementById('pendingBadge');
+const inviteRows = document.getElementById('inviteRows');
+const invitesEmpty = document.getElementById('invitesEmpty');
+const userRows = document.getElementById('userRows');
+
+let adminData = { users: [], invites: [] };
+
+function fmtExpiry(ms) {
+  if (!ms) return 'never';
+  const days = Math.ceil((ms - Date.now()) / 86400000);
+  return days <= 1 ? 'today' : `${days} days`;
+}
+
+function renderAccounts() {
+  // Invites.
+  inviteRows.replaceChildren();
+  for (const inv of adminData.invites) {
+    const tr = document.createElement('tr');
+
+    // Built from location.origin so it carries whatever hostname the admin is
+    // actually on — the tunnel URL, not something the server has to guess.
+    const link = `${location.origin}/register?invite=${encodeURIComponent(inv.code)}`;
+
+    const code = document.createElement('td');
+    const a = document.createElement('a');
+    a.className = 'invite';
+    a.href = link;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = link.replace(/^https?:\/\//, '');
+    a.title = link;
+    const sub = document.createElement('span');
+    sub.className = 'code-sub';
+    sub.textContent = inv.code;
+    code.append(a, sub);
+
+    const uses = document.createElement('td');
+    uses.textContent = inv.usesRemaining;
+
+    const exp = document.createElement('td');
+    exp.textContent = fmtExpiry(inv.expiresAt);
+
+    const act = document.createElement('td');
+    act.className = 'actions';
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = 'Copy link';
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(link);
+        copy.textContent = 'Copied';
+        setTimeout(() => (copy.textContent = 'Copy link'), 1200);
+      } catch {
+        // Clipboard access needs a permission in some browsers, and is blocked
+        // outright on plain http. The link is on screen either way.
+        copy.textContent = 'Select it';
+        setTimeout(() => (copy.textContent = 'Copy link'), 1600);
+      }
+    };
+    const revoke = document.createElement('button');
+    revoke.type = 'button';
+    revoke.className = 'danger';
+    revoke.textContent = 'Revoke';
+    revoke.onclick = () => send('admin:revoke', { code: inv.code });
+    act.append(copy, revoke);
+
+    tr.append(code, uses, exp, act);
+    inviteRows.appendChild(tr);
+  }
+  invitesEmpty.hidden = adminData.invites.length > 0;
+
+  // People. Pending first: they are the ones waiting on a decision.
+  const order = { pending: 0, active: 1, denied: 2 };
+  const users = [...adminData.users].sort(
+    (a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3) || a.username.localeCompare(b.username)
+  );
+
+  userRows.replaceChildren();
+  for (const u of users) {
+    const tr = document.createElement('tr');
+
+    const who = document.createElement('td');
+    const name = document.createElement('span');
+    name.className = 'who';
+    name.textContent = u.username;
+    who.appendChild(name);
+    if (u.role === 'admin') {
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = 'admin';
+      who.appendChild(tag);
+    }
+
+    const status = document.createElement('td');
+    const tag = document.createElement('span');
+    tag.className =
+      'tag' + (u.status === 'pending' ? ' waiting' : u.status === 'denied' ? ' denied' : '');
+    tag.textContent = u.status === 'pending' ? 'waiting' : u.status;
+    status.appendChild(tag);
+
+    const act = document.createElement('td');
+    act.className = 'actions';
+    const button = (label, danger, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      if (danger) b.className = 'danger';
+      b.textContent = label;
+      b.onclick = fn;
+      return b;
+    };
+    if (u.status === 'pending') {
+      act.append(
+        button('Approve', false, () => send('admin:status', { id: u.id, status: 'active' })),
+        button('Deny', true, () => send('admin:status', { id: u.id, status: 'denied' }))
+      );
+    } else if (u.status === 'active') {
+      act.append(button('Revoke', true, () => send('admin:status', { id: u.id, status: 'denied' })));
+    } else {
+      act.append(
+        button('Restore', false, () => send('admin:status', { id: u.id, status: 'active' }))
+      );
+    }
+    act.append(
+      button('Delete', true, () => {
+        if (confirm(`Delete ${u.username}? This cannot be undone.`)) {
+          send('admin:delete', { id: u.id });
+        }
+      })
+    );
+
+    tr.append(who, status, act);
+    userRows.appendChild(tr);
+  }
+
+  // The badge is the only reason an admin would think to open this panel.
+  const waiting = adminData.users.filter((u) => u.status === 'pending').length;
+  pendingBadge.textContent = waiting;
+  pendingBadge.hidden = waiting === 0;
+  accountsBtn.title = waiting ? `${waiting} waiting for approval` : 'Invites and people';
+}
+
+accountsBtn.onclick = () => {
+  accountsErr.hidden = true;
+  send('admin:state');
+  accountsDlg.showModal();
+};
+document.getElementById('accountsClose').onclick = () => accountsDlg.close();
+
+document.getElementById('inviteForm').onsubmit = (e) => {
+  e.preventDefault();
+  send('admin:invite', {
+    uses: parseInt(document.getElementById('inviteUses').value, 10) || 1,
+    days: parseInt(document.getElementById('inviteDays').value, 10) || 0,
+  });
+};
+
+function send(type, extra = {}) {
+  if (!applying && ws?.readyState === 1) {
+    ws.send(JSON.stringify({ type, ...extra }));
+  }
+}
+
+function control() {
+  if (applying) return;
+  if (isHost) {
+    send('control', { paused: v.paused, time: posInFile() });
+  } else if (state) {
+    // Not the host — snap straight back to whatever the room is doing.
+    applying = true;
+    clearTimeout(applyTimer);
+    applyTimer = setTimeout(() => { applying = false; }, 300);
+    // A viewer who pressed something has moved themselves deliberately, so
+    // unlike the periodic correction this does snap — but only when they are
+    // actually out. Reuse the loop's band so the two agree.
+    const target = targetTime();
+    if (Math.abs(posInFile() - target) > NUDGE) seekInFile(target);
+    if (state.paused && !v.paused) v.pause();
+    else if (!state.paused && v.paused) tryPlay();
+    flash('only the host can control playback');
+  }
+}
+
+let flashTimer;
+function flash(text) {
+  hintEl.textContent = text;
+  hintEl.className = 'holding';
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { hintEl.textContent = ''; hintEl.className = ''; }, 2500);
+}
+
+// --- picture shape -----------------------------------------------------------
+// The stage letterboxes itself with `aspect-ratio: var(--ar)`, so the box the
+// subtitle canvas and the autoplay gate are positioned against is exactly the
+// rendered picture. That only works if --ar tracks the file: a 4:3 episode in
+// a stage still shaped 16:9 puts the picture inside a wider box, and libass
+// draws the bottom line on the pillarbox rather than on the frame.
+const stageEl = document.getElementById('stage');
+
+function syncAspect() {
+  if (!v.videoWidth || !v.videoHeight) return;
+  const ar = `${v.videoWidth} / ${v.videoHeight}`;
+  if (stageEl.style.getPropertyValue('--ar') === ar) return;
+  stageEl.style.setProperty('--ar', ar);
+  dbg(`picture ${v.videoWidth}x${v.videoHeight} — stage ratio ${ar}`);
+  // The stage just changed shape, so the video's box did too. jassub's own
+  // ResizeObserver will fire for that, but it measures against the box as it
+  // was when the frame was handed over; asking explicitly avoids a frame of
+  // subtitles drawn at the old size.
+  if (jassub) jassub.resize().catch(() => {});
+}
+
+v.addEventListener('loadedmetadata', syncAspect);
+v.addEventListener('resize', syncAspect);
+
+// The window changing shape does not change the file's ratio, so --ar stands —
+// but the stage's pixel size changes, and libass has to be told. jassub
+// observes the video element, which does resize here, so this is a belt-and-
+// braces nudge for the case where the observer coalesces away the change.
+addEventListener('resize', () => {
+  if (jassub) jassub.resize().catch(() => {});
+});
+// The browser's own fullscreen button lives inside the video's native chrome
+// and takes the <video> element alone. The subtitle canvas is a sibling, so it
+// stays behind on the page and the viewer loses subtitles at the moment they
+// most want them. Catch that and promote the stage instead, which carries the
+// canvas and the gate with it.
+document.addEventListener('fullscreenchange', () => {
+  if (document.fullscreenElement === v) {
+    dbg('native fullscreen on the video — promoting the stage so subtitles come too');
+    // Swapping elements means leaving fullscreen first; doing both in one tick
+    // is refused, so the request rides on the change event that follows.
+    document.exitFullscreen().then(() => stageEl.requestFullscreen?.()).catch(() => {});
+    return;
+  }
+  if (jassub) jassub.resize().catch(() => {});
+});
+
+// Safari/iOS use their own element-only fullscreen that never enters the
+// standard API, so the same promotion has to hang off its own event.
+v.addEventListener('webkitbeginfullscreen', () => {
+  try {
+    v.webkitExitFullscreen?.();
+    stageEl.requestFullscreen?.();
+  } catch {}
+});
+
+// Double-click is the other way people go fullscreen on a video, and it has
+// the same problem. Bind it on the stage so it works over the subtitles too.
+stageEl.addEventListener('dblclick', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else stageEl.requestFullscreen?.();
+});
+
+v.addEventListener('play', control);
+v.addEventListener('pause', control);
+v.addEventListener('seeked', control);
+
+// Only hold the room if we were actually playing. A viewer who is paused,
+// blocked by autoplay, or still opening the file has no business freezing
+// everyone else — that was the bug where one person joining stopped the host.
+v.addEventListener('waiting', () => {
+  if (!v.paused && v.readyState < 3 && Date.now() - joinedAt > 2000) {
+    dbg(`buffering at ${v.currentTime.toFixed(2)}s (readyState=${v.readyState})`);
+    send('stall');
+  }
+});
+
+const ready = () => send('ready');
+v.addEventListener('playing', ready);
+v.addEventListener('canplay', ready);
+v.addEventListener('canplaythrough', ready);
+
+// A file this browser can't decode must not leave the room waiting on us.
+v.addEventListener('error', () => {
+  send('ready');
+  const codes = ['', 'playback aborted', 'network error', "this browser can't decode this file", 'file not supported'];
+  const why = codes[v.error?.code] || 'playback failed';
+  hintEl.textContent = why;
+  hintEl.className = 'holding';
+  dbg(`media error ${v.error?.code}: ${why}${v.error?.message ? ' — ' + v.error.message : ''}`, {
+    err: true,
+    toServer: true,
+  });
+});
+v.addEventListener('stalled', ready);
+v.addEventListener('emptied', ready);
+window.addEventListener('pagehide', ready);
+
+// --- drift correction --------------------------------------------------------
+// Runs on viewers only. The host *defines* room time, so measuring them
+// against it is circular: room time is whatever the host last reported, it
+// goes stale between their own control messages, and the correction then
+// fights the person it is supposed to be following — nudging their rate and
+// eventually seeking them. That is most of why the room felt like it was
+// wrestling with itself.
+//
+// Three bands, and the gap between them is what used to strand a viewer:
+//
+//   > HARD_SEEK   jump. Too far gone for the rate to close it in reasonable
+//                 time, and on a transcode a jump is a new encode anyway.
+//   > NUDGE       lean on playbackRate. Inaudible, and it closes a second of
+//                 drift in well under a minute.
+//   otherwise     rate 1.
+//
+// The old code hard-seeked above 2s but seekInFile, on the transcode path,
+// declined to restart an encode for anything under 3s — so a viewer sitting
+// between 2s and 3s out took the seek branch, got nothing, and never reached
+// the rate branch either. They stayed wrong indefinitely, which is exactly the
+// "it's ahead and not even trying" case. The thresholds are now defined
+// together and the transcode floor is the smaller of them.
+const NUDGE = 0.15;        // below this, leave it alone
+const HARD_SEEK = 2.5;     // above this, stop nudging and jump
+
+// How hard to lean. A viewer 2s out at 3% closes it in about a minute, which
+// is too slow to sit through, so the rate scales with the error and is capped
+// where it starts to be audible.
+function rateFor(drift) {
+  const pull = Math.min(Math.abs(drift) * 0.06, 0.12);
+  return drift > 0 ? 1 - pull : 1 + pull;
+}
+
+let driftTick = 0;
+setInterval(() => {
+  // The host is the reference, not a follower. Leave their player alone.
+  if (isHost) {
+    if (v.playbackRate !== 1) v.playbackRate = 1;
+    return;
+  }
+  if (!state || state.paused || v.paused || v.seeking || !loaded) {
+    // Don't leave a viewer running fast or slow because the room paused
+    // mid-correction — they would wake up drifting the other way.
+    if (v.playbackRate !== 1) v.playbackRate = 1;
+    return;
+  }
+  // A clock we have not measured yet makes every figure below meaningless.
+  if (!clockReady) return;
+
+  const target = targetTime();
+  const drift = posInFile() - target;
+
+  if (Math.abs(drift) > HARD_SEEK) {
+    dbg(`drift ${drift.toFixed(2)}s — hard seek to ${target.toFixed(2)}s`, { err: true });
+    v.playbackRate = 1;
+    seekInFile(target);
+  } else if (Math.abs(drift) > NUDGE) {
+    v.playbackRate = rateFor(drift);
+  } else if (v.playbackRate !== 1) {
+    v.playbackRate = 1;
+  }
+
+  // A periodic heartbeat, so the log shows the steady state and not just
+  // the moments something went wrong.
+  if (DEBUG && ++driftTick % 10 === 0) {
+    dbg(`drift ${drift >= 0 ? '+' : ''}${drift.toFixed(3)}s  rate=${v.playbackRate.toFixed(3)}  offset=${offset.toFixed(0)}ms  buffered=${
+      v.buffered.length ? (v.buffered.end(v.buffered.length - 1) - v.currentTime).toFixed(1) + 's ahead' : 'none'
+    }`);
+  }
+}, 1000);
+
+// --- host heartbeat ----------------------------------------------------------
+// Room time is an anchor plus elapsed wall clock, and the anchor only used to
+// move when the host pressed something. An hour into an untouched film every
+// viewer is extrapolating from an hour-old reading, so any error in the
+// anchor — or in the host's own playback rate, which is never exactly 1.0 —
+// has had an hour to accumulate. Viewers then sit steadily ahead or behind
+// with nothing to correct against, because the thing they are measuring
+// against is itself wrong.
+//
+// So the host reports where they actually are, and the server re-anchors on
+// it. This is not a control: it does not play, pause or seek anyone. It only
+// keeps the reference honest, which is why it is safe to send often.
+setInterval(() => {
+  if (!isHost || !ws || ws.readyState !== 1) return;
+  if (!state || !loaded) return;
+  // A host who is buffering or seeking is not a reliable reading of anything.
+  if (v.seeking || v.readyState < 2) return;
+  // Paused is already an exact anchor; re-sending it just adds noise.
+  if (v.paused || state.paused) return;
+  ws.send(JSON.stringify({ type: 'heartbeat', time: posInFile() }));
+}, 2000);
+
+// Report our own health for the People panel. Separate from the drift timer,
+// which returns early while paused — a paused viewer is still worth showing.
+setInterval(() => {
+  if (!ws || ws.readyState !== 1) return;
+  const drift = state && loaded ? posInFile() - targetTime() : null;
+  ws.send(
+    JSON.stringify({
+      type: 'stat',
+      rtt: lastRtt,
+      drift: Number.isFinite(drift) ? drift : null,
+      muted: v.muted,
+    })
+  );
+}, 3000);
+
+// --- notices -----------------------------------------------------------------
+// Transient messages over the video: who joined, who left, why playback
+// stopped. A dropped connection is the one worth reading, so it lingers.
+
+const noticesEl = document.getElementById('notices');
+
+function notice(text, kind = 'info') {
+  const el = document.createElement('div');
+  el.className = 'notice ' + kind;
+  el.textContent = text;
+  noticesEl.appendChild(el);
+  // Keep the stack short; three at once is already more than anyone reads.
+  while (noticesEl.childElementCount > 3) noticesEl.firstChild.remove();
+  setTimeout(() => el.remove(), kind === 'drop' ? 9000 : 4500);
+}
+
+// --- log ---------------------------------------------------------------------
+
+const logView = document.getElementById('logView');
+const logNote = document.getElementById('logNote');
+let logSeen = 0;
+
+function renderLog(lines, append) {
+  if (!append) {
+    logView.replaceChildren();
+    logSeen = 0;
+  }
+  for (const entry of lines) {
+    if (entry.n <= logSeen) continue;
+    logSeen = entry.n;
+    const row = document.createElement('div');
+    const t = document.createElement('span');
+    t.className = 'l-time';
+    t.textContent = new Date(entry.t).toLocaleTimeString();
+    const body = document.createElement('span');
+    // Colour the two that matter at a glance: failures and arrivals.
+    if (/^!|refused|blocked|error|failed/i.test(entry.line)) body.className = 'l-err';
+    else if (/^\+/.test(entry.line)) body.className = 'l-join';
+    body.textContent = entry.line;
+    row.append(t, body);
+    logView.appendChild(row);
+  }
+  while (logView.childElementCount > 400) logView.firstChild.remove();
+  const atBottom = logView.scrollHeight - logView.scrollTop - logView.clientHeight < 60;
+  if (atBottom) logView.scrollTop = logView.scrollHeight;
+  logNote.textContent = `${logView.childElementCount} lines · newest at the bottom`;
+}
+
+// --- sidebar -----------------------------------------------------------------
+
+for (const tab of document.querySelectorAll('#tabs .tab')) {
+  tab.onclick = () => {
+    for (const t of document.querySelectorAll('#tabs .tab')) t.classList.toggle('on', t === tab);
+    for (const p of document.querySelectorAll('#side .panel')) {
+      p.hidden = p.id !== tab.dataset.panel;
+    }
+    // The log is only fetched when someone looks at it; there is no point
+    // streaming history to a panel nobody has open.
+    if (tab.dataset.panel === 'logPanel') send('admin:log');
+    // Same reasoning for the encode panel, and more so: working out which
+    // files need converting means an ffprobe per file, which is not worth
+    // spending on a panel that may never be opened.
+    if (tab.dataset.panel === 'encodePanel') {
+      send('encode:state');
+      renderEncode();
+      probeLibrary();
+    }
+  };
+}
+
+const peopleList = document.getElementById('peopleList');
+const peopleNote = document.getElementById('peopleNote');
+const peopleCount = document.getElementById('peopleCount');
+const serverStats = document.getElementById('serverStats');
+const statsNote = document.getElementById('statsNote');
+
+// How a viewer is doing, in the order that matters when something is wrong.
+function health(c) {
+  if (c.buffering) return { label: 'buffering', cls: 'bad' };
+  if (c.rtt === null) return { label: 'no data', cls: 'dim' };
+  if (c.drift !== null && Math.abs(c.drift) > 2) {
+    return { label: `${c.drift > 0 ? 'ahead' : 'behind'} ${Math.abs(c.drift).toFixed(1)}s`, cls: 'warn' };
+  }
+  if (c.rtt > 400) return { label: 'high latency', cls: 'warn' };
+  return { label: 'synced', cls: 'good' };
+}
+
+function renderPeople(clients) {
+  peopleCount.textContent = clients.length;
+  peopleList.replaceChildren();
+
+  for (const c of clients) {
+    const h = health(c);
+    const li = document.createElement('li');
+    li.className = 'person';
+
+    const dot = document.createElement('span');
+    dot.className = 'dot ' + h.cls;
+
+    const main = document.createElement('div');
+    main.className = 'person-main';
+    const name = document.createElement('div');
+    name.className = 'person-name';
+    name.textContent = c.name;
+    if (c.host) {
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = 'host';
+      name.appendChild(tag);
+    }
+    if (c.muted) {
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = 'muted';
+      name.appendChild(tag);
+    }
+    const sub = document.createElement('div');
+    sub.className = 'person-sub ' + h.cls;
+    sub.textContent = h.label + (c.rtt !== null ? ` · ${c.rtt} ms` : '');
+
+    main.append(name, sub);
+    li.append(dot, main);
+    peopleList.appendChild(li);
+  }
+
+  peopleNote.textContent = clients.length ? '' : 'Nobody else is connected.';
+}
+
+function renderServerStats(srv) {
+  if (!srv) {
+    // Viewers never receive this half, so say why the panel is empty rather
+    // than leaving it looking broken.
+    statsNote.textContent = 'Server stats are visible to the host only.';
+    return;
+  }
+  statsNote.textContent = `up ${fmtUptime(srv.uptime)} · ${srv.rss} MB resident`;
+  const cells = [
+    ['CPU (machine)', `${srv.cpu}%`, srv.cpu > 85 ? 'bad' : srv.cpu > 60 ? 'warn' : 'good'],
+    ['CPU (this app)', `${srv.procCpu}%`, srv.procCpu > 85 ? 'bad' : srv.procCpu > 60 ? 'warn' : 'good'],
+    ['Upload', `${srv.mbpsOut} Mbps`, ''],
+    ['Disk read', `${srv.mbpsRead} Mbps`, ''],
+  ];
+  serverStats.replaceChildren();
+  for (const [label, value, cls] of cells) {
+    const box = document.createElement('div');
+    box.className = 'stat';
+    const l = document.createElement('div');
+    l.className = 'stat-label';
+    l.textContent = label;
+    const v = document.createElement('div');
+    v.className = 'stat-value ' + cls;
+    v.textContent = value;
+    box.append(l, v);
+    serverStats.appendChild(box);
+  }
+}
+
+function fmtUptime(s) {
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  const h = Math.floor(s / 3600);
+  return h < 24 ? `${h}h ${Math.floor((s % 3600) / 60)}m` : `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+// --- encode queue ------------------------------------------------------------
+// Converting a file the browser cannot decode is now something the host asks
+// for, ahead of time, rather than something playback sets off. This panel is
+// where that happens: it lists every file that needs converting, what state it
+// is in, and how far along the one that is running has got.
+//
+// The list is assembled from two sources. /list says what is in the library
+// and which ids already have an encode on disk; the server's `encode` message
+// says what is queued, running, finished or failed. A file can be in either or
+// both, so rows are keyed by id and merged.
+
+const encodeListEl = document.getElementById('encodeList');
+const encodeNote = document.getElementById('encodeNote');
+const encodeErr = document.getElementById('encodeErr');
+const encodeDisk = document.getElementById('encodeDisk');
+const encodeClear = document.getElementById('encodeClear');
+const encodeCount = document.getElementById('encodeCount');
+
+let encodeData = { available: true, items: [], usedBytes: 0, limitGb: 0 };
+let encodeErrTimer = null;
+// id -> { ok, reasons } from /tracks, so the panel can say *why* a file needs
+// converting. Filled in lazily: probing the whole library up front would run
+// ffprobe hundreds of times to answer a question about a handful of files.
+const playability = new Map();
+let probing = false;
+
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), u.length - 1);
+  return `${(n / 1024 ** i).toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+
+function fmtAgo(ms) {
+  if (!ms) return '';
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
+
+// Probe files we have not judged yet, a few at a time. Serial and capped:
+// ffprobe on a network share is not free, and the answer for any one file
+// never changes, so there is no hurry and no reason to ask twice.
+async function probeLibrary() {
+  if (probing || !isHost) return;
+  probing = true;
+  try {
+    for (const f of library) {
+      if (playability.has(f.id)) continue;
+      // Already encoded, so whether the source is playable is moot.
+      if (f.encoded) continue;
+      try {
+        const t = await fetch('/tracks/' + f.id).then((r) => r.json());
+        playability.set(f.id, t.play || { ok: true, reasons: [] });
+      } catch {
+        playability.set(f.id, { ok: true, reasons: [] });
+      }
+      renderEncode();
+    }
+  } finally {
+    probing = false;
+  }
+}
+
+// Everything worth showing: files that need converting, plus anything the
+// queue knows about regardless of whether it still does.
+function encodeRows() {
+  const byId = new Map();
+
+  for (const f of library) {
+    const verdict = playability.get(f.id);
+    const needs = verdict ? !verdict.ok : null;
+    // Unknown (not probed yet) and known-fine files are both left out — the
+    // panel is a work list, not a second copy of the library.
+    if (!f.encoded && needs !== true) continue;
+    byId.set(f.id, {
+      id: f.id,
+      label: f.label,
+      name: f.name,
+      encoded: f.encoded,
+      why: verdict?.reasons?.[0]?.text || '',
+      status: f.encoded ? 'ready' : 'none',
+      percent: 0,
+      error: null,
+    });
+  }
+
+  for (const item of encodeData.items) {
+    const row = byId.get(item.id) || {
+      id: item.id,
+      label: item.label,
+      name: item.label.split('/').pop(),
+      encoded: false,
+      why: '',
+    };
+    // The queue is the more recent truth about anything it is tracking.
+    row.status = item.status;
+    row.percent = item.percent || 0;
+    row.error = item.error;
+    row.finishedAt = item.finishedAt;
+    row.startedAt = item.startedAt;
+    byId.set(item.id, row);
+  }
+
+  // Running first, then waiting, then everything still to do, then the
+  // finished ones — roughly the order attention is worth spending.
+  const rank = { encoding: 0, queued: 1, failed: 2, none: 3, done: 4, ready: 5 };
+  return [...byId.values()].sort(
+    (a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || a.label.localeCompare(b.label)
+  );
+}
+
+function renderEncode() {
+  if (!isHost) return;
+  const rows = encodeRows();
+
+  // The tab badge counts outstanding work, not the whole list: a done row is
+  // not something anyone needs to come back to.
+  const busy = rows.filter((r) => r.status === 'encoding' || r.status === 'queued').length;
+  encodeCount.textContent = String(busy);
+  encodeCount.hidden = busy === 0;
+
+  encodeListEl.replaceChildren();
+
+  for (const r of rows) {
+    const li = document.createElement('li');
+    li.className = 'enc';
+
+    const name = document.createElement('div');
+    name.className = 'enc-name';
+    name.textContent = r.name;
+    name.title = r.label;
+
+    const right = document.createElement('div');
+
+    const stateOf = (text, cls) => {
+      const s = document.createElement('span');
+      s.className = 'enc-state' + (cls ? ' ' + cls : '');
+      s.textContent = text;
+      return s;
+    };
+
+    const button = (label, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.onclick = fn;
+      return b;
+    };
+
+    if (r.status === 'encoding') {
+      right.appendChild(stateOf(`${r.percent.toFixed(0)}%`));
+      right.appendChild(button('Stop', () => send('encode:cancel', { id: r.id })));
+    } else if (r.status === 'queued') {
+      right.appendChild(stateOf('waiting'));
+      right.appendChild(button('Remove', () => send('encode:cancel', { id: r.id })));
+    } else if (r.status === 'done' || r.status === 'ready') {
+      right.appendChild(
+        stateOf(r.finishedAt ? `ready · ${fmtAgo(r.finishedAt)}` : 'ready', 'done')
+      );
+    } else if (r.status === 'failed') {
+      right.appendChild(stateOf('failed', 'bad'));
+      right.appendChild(button('Retry', () => send('encode:queue', { id: r.id })));
+    } else {
+      right.appendChild(button('Encode', () => send('encode:queue', { id: r.id })));
+    }
+
+    li.append(name, right);
+
+    // The reason it needs converting, or the reason it failed. Either way it
+    // is the line that saves the host guessing.
+    const why = r.error || r.why;
+    if (why && r.status !== 'ready' && r.status !== 'done') {
+      const p = document.createElement('div');
+      p.className = 'enc-why' + (r.error ? ' bad' : '');
+      p.textContent = why;
+      li.appendChild(p);
+    }
+
+    if (r.status === 'encoding') {
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      const fill = document.createElement('i');
+      fill.style.width = `${r.percent}%`;
+      bar.appendChild(fill);
+      li.appendChild(bar);
+    }
+
+    encodeListEl.appendChild(li);
+  }
+
+  const orphans = (encodeData.orphans || []).length;
+  if (!encodeData.available) {
+    encodeNote.textContent = 'ffmpeg is not installed on the server, so nothing can be converted.';
+  } else if (!rows.length && orphans) {
+    encodeNote.textContent =
+      `Nothing needs converting, but ${orphans} converted file${orphans === 1 ? '' : 's'} ` +
+      'no longer match anything in the library.';
+  } else if (!rows.length) {
+    encodeNote.textContent = probing
+      ? 'Checking the library…'
+      : 'Nothing needs converting. Every file plays in the browser as it is.';
+  } else {
+    encodeNote.textContent = busy
+      ? `${busy} file${busy === 1 ? '' : 's'} to go. One converts at a time.`
+      : 'Queue a file to convert it before you play it.';
+  }
+
+  // Converted files whose source has gone: the library was reorganised, or the
+  // file was deleted. Nothing will ever ask for them again and they count
+  // against the disk budget, so they are worth showing — but only as something
+  // to delete, since there is no source left to re-encode.
+  for (const o of encodeData.orphans || []) {
+    const li = document.createElement('li');
+    li.className = 'enc';
+
+    const name = document.createElement('div');
+    name.className = 'enc-name';
+    name.textContent = `Orphaned conversion (${fmtBytes(o.size)})`;
+
+    const right = document.createElement('div');
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = 'Delete';
+    b.onclick = () => send('encode:forget', { id: o.id });
+    right.appendChild(b);
+
+    const whyEl = document.createElement('div');
+    whyEl.className = 'enc-why';
+    whyEl.textContent =
+      'The file this was converted from is no longer in the library — moved, ' +
+      'deleted, or MEDIA_DIRS was reordered, which changes every id.';
+
+    li.append(name, right, whyEl);
+    encodeListEl.appendChild(li);
+  }
+
+  encodeDisk.textContent = encodeData.limitGb
+    ? `${fmtBytes(encodeData.usedBytes)} of ${encodeData.limitGb} GB used`
+    : '';
+  encodeClear.hidden = !rows.some((r) => r.status === 'done' || r.status === 'failed');
+}
+
+encodeClear.onclick = () => send('encode:clear');
+
+// --- library -----------------------------------------------------------------
+// A filtered list rather than a <select>: a select cannot wrap, ellipsize or be
+// searched, and the folder a file sits in is often the only way to tell two
+// episodes apart.
+
+const filterEl = document.getElementById('filter');
+const fileListEl = document.getElementById('fileList');
+const fileNote = document.getElementById('fileNote');
+const pickedName = document.getElementById('pickedName');
+const loadBtn = document.getElementById('load');
+
+let library = [];
+let picked = null;
+
+function renderLibrary() {
+  const q = filterEl.value.trim().toLowerCase();
+  // Match against the full label so a folder name finds everything under it.
+  const hits = q ? library.filter((f) => f.label.toLowerCase().includes(q)) : library;
+
+  fileListEl.replaceChildren();
+  let lastDir = null;
+  for (const f of hits.slice(0, 400)) {
+    if (f.dir !== lastDir) {
+      lastDir = f.dir;
+      const li = document.createElement('li');
+      li.className = 'dir';
+      li.title = f.dir || 'library root';
+      // Wrapped in a span so the rtl trick on the parent clips the head of the
+      // path rather than reversing the text itself.
+      const inner = document.createElement('span');
+      inner.textContent = f.dir || 'library root';
+      li.appendChild(inner);
+      fileListEl.appendChild(li);
+    }
+    const li = document.createElement('li');
+    li.className = 'file' + (picked === f.id ? ' on' : '');
+    li.tabIndex = 0;
+    li.title = f.label;
+    li.textContent = f.name;
+    const choose = () => {
+      picked = f.id;
+      pickedName.textContent = f.name;
+      pickedName.title = f.label;
+      loadBtn.disabled = !isHost;
+      renderLibrary();
+    };
+    li.onclick = choose;
+    li.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        choose();
+      }
+    };
+    // Double-click plays straight away — the list is long and the button is
+    // at the bottom.
+    li.ondblclick = () => {
+      choose();
+      if (isHost) send('load', { src: f.id });
+    };
+    fileListEl.appendChild(li);
+  }
+
+  if (!library.length) fileNote.textContent = 'Nothing found in the scanned paths.';
+  else if (!hits.length) fileNote.textContent = `No file matches "${filterEl.value.trim()}".`;
+  else if (hits.length > 400) fileNote.textContent = `Showing 400 of ${hits.length} — keep typing.`;
+  else fileNote.textContent = `${hits.length} file${hits.length === 1 ? '' : 's'}`;
+}
+
+filterEl.oninput = renderLibrary;
+loadBtn.onclick = () => {
+  if (picked && isHost) send('load', { src: picked });
+};
+
+function loadLibrary() {
+  return fetch('/list')
+    .then((r) => r.json())
+    .then((files) => {
+      library = files;
+      renderLibrary();
+      renderEncode();
+    })
+    .catch(() => {
+      fileNote.textContent = 'Could not read the library.';
+    });
+}
+
+loadLibrary();
+
+// Closing the tab is not a dropped connection: say so, so the room is not
+// paused on everyone else's behalf.
+addEventListener('pagehide', () => {
+  try {
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ type: 'bye' }));
+  } catch {}
+});
+
+connect();
+</script>
+</body>
+</html>
