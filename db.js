@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS invites (
   uses_remaining INTEGER NOT NULL,
   expires_at     INTEGER
 );
+
+-- ffprobe's verdict for a file, keyed by library id. Everything else derived
+-- from the library stays in memory (see the note at the top of this file),
+-- but ffprobe is a real subprocess and a library can run into the hundreds of
+-- files: without this, every server restart re-shells out to ffprobe for the
+-- whole library the moment a host's page asks the Encode panel to render.
+CREATE TABLE IF NOT EXISTS track_cache (
+  id    TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `;
 
 // Columns added after the first release. CREATE TABLE IF NOT EXISTS will not
@@ -103,6 +113,32 @@ function serverSecret() {
     setSetting('server_secret', s);
   }
   return s;
+}
+
+// --- track cache ---------------------------------------------------------------
+// ffprobe's verdict for a file, by library id. The id is a content hash, so a
+// stale row just means "this exact file was probed before" — never wrong,
+// only possibly redundant, which is why there is no expiry.
+
+function getTrackCache(id) {
+  const row = db.prepare('SELECT value FROM track_cache WHERE id = ?').get(id);
+  if (!row) return null;
+  try {
+    return JSON.parse(row.value);
+  } catch {
+    return null;
+  }
+}
+
+function setTrackCache(id, value) {
+  db.prepare(
+    'INSERT INTO track_cache (id, value) VALUES (?, ?) ' +
+      'ON CONFLICT(id) DO UPDATE SET value = excluded.value'
+  ).run(id, JSON.stringify(value));
+}
+
+function deleteTrackCache(id) {
+  db.prepare('DELETE FROM track_cache WHERE id = ?').run(id);
 }
 
 // --- passwords ---------------------------------------------------------------
@@ -289,6 +325,9 @@ module.exports = {
   sessionEpoch,
   getPrefs,
   setPref,
+  getTrackCache,
+  setTrackCache,
+  deleteTrackCache,
   createInvite,
   listInvites,
   deleteInvite,

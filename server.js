@@ -340,6 +340,8 @@ function checkFfprobe() {
   });
 }
 
+// Hot path is the in-memory Map; the db behind it only matters across a
+// restart, so it is populated lazily on first miss rather than preloaded.
 const trackCache = new Map(); // id -> { audio: [], subs: [] }
 
 function describe(stream, i) {
@@ -443,16 +445,44 @@ const CACHE_DIR = process.env.CACHE_DIR
   : path.join(DATA_DIR, 'transcoded');
 const CACHE_LIMIT_GB = Number(process.env.TRANSCODE_CACHE_GB || 20);
 
-function cachePath(id) {
-  return path.join(CACHE_DIR, `${id}.mp4`);
+// The on-disk name carries the source's own name purely so a human looking at
+// CACHE_DIR (or a filename in a log line) can tell which episode a cache file
+// is without cross-referencing ids — lookups never rely on it. The id prefix
+// stays the sole source of truth: it is unique and stable, while the slug is
+// neither (two files can share a name, and a rename upstream orphans nothing
+// here since nothing reads the slug back).
+function slugify(name) {
+  return path
+    .basename(name, path.extname(name))
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'file';
+}
+
+function cachePath(id, name) {
+  return path.join(CACHE_DIR, `${id}.${slugify(name)}.mp4`);
+}
+
+// Old caches (or a lookup with no `name` on hand) may only have `<id>.mp4`;
+// glob for anything starting with the id so both forms resolve.
+function findCachePath(id) {
+  const bare = path.join(CACHE_DIR, `${id}.mp4`);
+  if (fs.existsSync(bare)) return bare;
+  try {
+    const hit = fs.readdirSync(CACHE_DIR).find((f) => f.startsWith(`${id}.`) && f.endsWith('.mp4'));
+    return hit ? path.join(CACHE_DIR, hit) : bare;
+  } catch {
+    return bare;
+  }
 }
 
 function cachedFile(id) {
   try {
-    const st = fs.statSync(cachePath(id));
+    const p = findCachePath(id);
+    const st = fs.statSync(p);
     // A part-written file from a killed process would play as a truncated
     // film, so only a finished marker counts.
-    if (st.isFile() && st.size > 0 && fs.existsSync(cachePath(id) + '.done')) return cachePath(id);
+    if (st.isFile() && st.size > 0 && fs.existsSync(p + '.done')) return p;
   } catch {}
   return null;
 }
@@ -549,7 +579,7 @@ function orphanEncodes() {
     for (const id of encodedIds()) {
       if (library.has(id)) continue;
       let size = 0;
-      try { size = fs.statSync(cachePath(id)).size; } catch { continue; }
+      try { size = fs.statSync(findCachePath(id)).size; } catch { continue; }
       out.push({ id, size });
     }
   } catch {}
@@ -562,8 +592,9 @@ function deleteOrphan(id, by) {
   if (library.has(id)) return { ok: false, error: 'That file is still in the library.' };
   if (!cachedFile(id)) return { ok: false, error: 'No such converted file.' };
   try {
-    fs.rmSync(cachePath(id), { force: true });
-    fs.rmSync(cachePath(id) + '.done', { force: true });
+    const p = findCachePath(id);
+    fs.rmSync(p, { force: true });
+    fs.rmSync(p + '.done', { force: true });
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -709,7 +740,7 @@ function pumpQueue() {
     return pumpQueue();
   }
 
-  const out = cachePath(next.id);
+  const out = cachePath(next.id, entry.name);
   const tmp = out + '.part';
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -806,6 +837,7 @@ function pumpQueue() {
           pruneCache();
           // The client caches the probe, and `cached` is part of it.
           trackCache.delete(next.id);
+          db.deleteTrackCache(next.id);
           pushEncodeState();
           notifyAdmins({
             type: 'notice',
@@ -852,12 +884,16 @@ function sweepPartFiles() {
 // Encoded files that no queue row remembers — from an earlier run, or rows
 // that were cleared. The panel lists these as ready so an admin can see what
 // is on disk without keeping the queue forever.
+//
+// A cache file is `<id>.mp4.done` (old, unlabelled) or `<id>.<slug>.mp4.done`
+// (current). The id is only ever the first dot-separated segment, so take
+// that rather than assuming the rest of the stem is the id.
 function encodedIds() {
   const out = new Set();
   try {
     for (const f of fs.readdirSync(CACHE_DIR)) {
       if (!f.endsWith('.mp4.done')) continue;
-      out.add(f.slice(0, -'.mp4.done'.length));
+      out.add(f.slice(0, f.indexOf('.')));
     }
   } catch {}
   return out;
@@ -906,6 +942,15 @@ function probeTracks(id) {
   const cached = trackCache.get(id);
   if (cached) return Promise.resolve(cached);
 
+  // The id is a content hash, so a row from a previous boot is never stale —
+  // only possibly for a file that no longer exists, which the entry check
+  // below still guards against on every call regardless of cache source.
+  const stored = db.getTrackCache(id);
+  if (stored) {
+    trackCache.set(id, stored);
+    return Promise.resolve(stored);
+  }
+
   const entry = library.get(id);
   if (!entry) return Promise.resolve({ audio: [], subs: [], video: null, duration: 0, play: { ok: true } });
 
@@ -914,7 +959,9 @@ function probeTracks(id) {
       new Promise((resolve) => {
         if (!ok) {
           // No ffprobe: we cannot judge, so claim nothing and let the browser
-          // try. Silence is better than a wrong warning.
+          // try. Silence is better than a wrong warning. Kept in-memory only —
+          // ffprobe showing up later (installed after the fact) should get a
+          // real probe next time, not a persisted "unknown" forever.
           const empty = { audio: [], subs: [], video: null, duration: 0, play: { ok: true } };
           trackCache.set(id, empty);
           return resolve(empty);
@@ -955,6 +1002,7 @@ function probeTracks(id) {
               } catch {}
             }
             trackCache.set(id, out);
+            db.setTrackCache(id, out);
             resolve(out);
           }
         );

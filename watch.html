@@ -884,10 +884,10 @@
       <button id="load" type="button" disabled>Play this for everyone</button>
       <div class="picked-name" id="pickedName">Pick a file below</div>
       <div id="trackRow">
-        <label class="track" id="audioWrap" hidden>audio
+        <label class="track admin-only" id="audioWrap" hidden>audio
           <select id="audioSel"></select>
         </label>
-        <label class="track" id="subWrap" hidden>subs
+        <label class="track admin-only" id="subWrap" hidden>subs
           <select id="subSel"></select>
         </label>
         <button id="accountsBtn" type="button" title="Invites and people">
@@ -2573,6 +2573,12 @@ function fmtAgo(ms) {
 // Probe files we have not judged yet, a few at a time. Serial and capped:
 // ffprobe on a network share is not free, and the answer for any one file
 // never changes, so there is no hurry and no reason to ask twice.
+//
+// `/list`'s `playable` field is the server's own persisted verdict (survives
+// a restart — see track_cache in db.js), so a file it already has an answer
+// for costs nothing to skip here. Only a file `/list` reports as `null` —
+// genuinely never probed — is worth a `/tracks/<id>` round trip; without this
+// check, every page load re-probed the entire library from scratch.
 async function probeLibrary() {
   if (probing || !isHost) return;
   probing = true;
@@ -2581,6 +2587,10 @@ async function probeLibrary() {
       if (playability.has(f.id)) continue;
       // Already encoded, so whether the source is playable is moot.
       if (f.encoded) continue;
+      if (f.playable != null) {
+        playability.set(f.id, { ok: f.playable, reasons: [] });
+        continue;
+      }
       try {
         const t = await fetch('/tracks/' + f.id).then((r) => r.json());
         playability.set(f.id, t.play || { ok: true, reasons: [] });

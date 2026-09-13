@@ -230,6 +230,18 @@ reads as a network fault and sends you debugging the tunnel. So `/tracks/<id>`
 reports a **playability verdict** from the ffprobe data it was already
 collecting, and the client uses that instead of letting the decoder fail.
 
+`/tracks/<id>`'s verdict is backed by ffprobe, a real subprocess, so it is
+cached — not just in memory (`trackCache`, cleared by a restart) but in
+`track_cache` in sqlite. This is a deliberate exception to db.js's stated
+"derived data stays in memory" rule: the id is a content hash, so a stored row
+is never wrong, only possibly for a file that no longer exists (still checked
+on every read), and the alternative was every server restart re-shelling out to
+ffprobe for an entire library — hundreds of requests — the moment a host's page
+first asked the Encode panel to render. `/list` exposes the persisted verdict
+per file (`playable`) for free; the client's `probeLibrary()` only calls
+`/tracks/<id>` for a file `/list` reports as `null` (never probed by anyone,
+ever), not merely "not probed this page load".
+
 Unplayable files are converted **ahead of time**, from the admin's Encode panel.
 This replaced on-demand transcoding, and the reasoning is worth preserving:
 
@@ -245,11 +257,20 @@ starts an encoder. The queue runs **one at a time**, keeps going when the room
 empties (it is work requested ahead of time), and reports progress from ffmpeg's
 `-progress` stream rather than by scraping stderr.
 
-A finished encode is `<CACHE_DIR>/<id>.mp4` plus a `.done` marker — the marker
-is what distinguishes a complete encode from one killed halfway, which would
-otherwise play as a truncated film. `.part` files are reaped on process `exit`
-(not at kill time: the signal is asynchronous, and on Windows an open handle
-makes the unlink fail) and swept at startup.
+A finished encode is `<CACHE_DIR>/<id>.<slug>.mp4` plus a `.done` marker — the
+marker is what distinguishes a complete encode from one killed halfway, which
+would otherwise play as a truncated film. `.part` files are reaped on process
+`exit` (not at kill time: the signal is asynchronous, and on Windows an open
+handle makes the unlink fail) and swept at startup.
+
+**The slug is cosmetic, never authoritative.** It exists so a human looking at
+`CACHE_DIR` (or a filename in a log line) can tell which episode a cache file
+is without cross-referencing ids — the id, everything before the first `.`, is
+still the only thing any lookup keys on. `findCachePath(id)` globs for
+`<id>.*.mp4` (falling back to the bare `<id>.mp4` a pre-existing cache or an
+orphan fixture may have) rather than assuming the exact name, precisely
+because the slug can collide, go stale after a rename upstream, or simply be
+absent — none of which should ever make a conversion unfindable.
 
 **Orphans** are converted files whose source id is no longer in the library —
 deleted, moved, or `MEDIA_DIRS` reordered. They count against the disk budget

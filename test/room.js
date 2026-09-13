@@ -348,8 +348,11 @@ function waitForServer(tries = 40) {
         );
 
         // Make one, by giving a real encode an id the library does not know.
+        // The cache file is named `<id>.<slug>.mp4`, not bare `<id>.mp4`, so
+        // find it by prefix rather than assuming the exact name.
         const cacheDir = path.join(tmp, 'transcoded');
-        fs.copyFileSync(path.join(cacheDir, `${hv.id}.mp4`), path.join(cacheDir, 'deadbeef99.mp4'));
+        const hvCacheFile = fs.readdirSync(cacheDir).find((f) => f.startsWith(`${hv.id}.`) && f.endsWith('.mp4'));
+        fs.copyFileSync(path.join(cacheDir, hvCacheFile), path.join(cacheDir, 'deadbeef99.mp4'));
         fs.writeFileSync(path.join(cacheDir, 'deadbeef99.mp4.done'), '');
         admin.send({ type: 'encode:state' });
         await wait(500);
@@ -366,7 +369,7 @@ function waitForServer(tries = 40) {
         await wait(400);
         say(!!admin.last('encode:error'), 'deleting a conversion still in the library is refused');
         say(
-          fs.existsSync(path.join(cacheDir, `${hv.id}.mp4`)),
+          fs.existsSync(path.join(cacheDir, hvCacheFile)),
           'the refused delete left the file alone'
         );
 
@@ -384,7 +387,7 @@ function waitForServer(tries = 40) {
 
         // A viewer must not be able to delete anything.
         const g5 = await open(guestCookie);
-        fs.copyFileSync(path.join(cacheDir, `${hv.id}.mp4`), path.join(cacheDir, 'deadbeef98.mp4'));
+        fs.copyFileSync(path.join(cacheDir, hvCacheFile), path.join(cacheDir, 'deadbeef98.mp4'));
         fs.writeFileSync(path.join(cacheDir, 'deadbeef98.mp4.done'), '');
         g5.send({ type: 'encode:forget', id: 'deadbeef98' });
         await wait(600);
