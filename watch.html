@@ -913,9 +913,9 @@
       <ul id="fileList"></ul>
       <p class="note" id="fileNote"></p>
 
-      <!-- What used to be a separate Encode tab, folded in here: converting a
-           file the browser cannot decode is something the host asks for ahead
-           of time. Per-file "encode"/"retry"/progress lives inline on each
+      <!-- Converting a file the browser cannot decode is something the host
+           picks directly from the Library list, not something discovered for
+           them. Per-file "encode"/"retry"/progress lives inline on each
            Library row above; this strip is only for what a row in a different
            folder cannot show — active/queued jobs, disk usage, and orphaned
            conversions. Collapsed to one summary line when there is nothing to
@@ -1243,12 +1243,10 @@ function setRole(host) {
   v.controlsList = host ? '' : 'nodownload noplaybackrate';
   // The encode strip now lives inline in the Library panel rather than its
   // own tab, so what used to run when that tab was opened now runs once as
-  // soon as we know we are host — the per-row badges need it immediately,
-  // not only once someone expands the strip.
+  // soon as we know we are host.
   if (becameHost && !encodeInitialized) {
     encodeInitialized = true;
     send('encode:state');
-    probeLibrary();
   }
 }
 
@@ -2531,15 +2529,10 @@ function fmtUptime(s) {
 }
 
 // --- encode queue ------------------------------------------------------------
-// Converting a file the browser cannot decode is now something the host asks
-// for, ahead of time, rather than something playback sets off. This panel is
-// where that happens: it lists every file that needs converting, what state it
-// is in, and how far along the one that is running has got.
-//
-// The list is assembled from two sources. /list says what is in the library
-// and which ids already have an encode on disk; the server's `encode` message
-// says what is queued, running, finished or failed. A file can be in either or
-// both, so rows are keyed by id and merged.
+// Converting a file the browser cannot decode is something the host picks,
+// per file, from the Library list — nothing here discovers or suggests what
+// needs it. This strip just shows what the server's `encode` message reports:
+// queued, running, finished or failed, plus disk usage and orphans.
 
 const encodeListEl = document.getElementById('encodeList');
 const encodeNote = document.getElementById('encodeNote');
@@ -2549,11 +2542,6 @@ const encodeClear = document.getElementById('encodeClear');
 
 let encodeData = { available: true, items: [], usedBytes: 0, limitGb: 0 };
 let encodeErrTimer = null;
-// id -> { ok, reasons } from /tracks, so the panel can say *why* a file needs
-// converting. Filled in lazily: probing the whole library up front would run
-// ffprobe hundreds of times to answer a question about a handful of files.
-const playability = new Map();
-let probing = false;
 
 function fmtBytes(n) {
   if (!n) return '0 B';
@@ -2570,62 +2558,10 @@ function fmtAgo(ms) {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
-// Probe files we have not judged yet, a few at a time. Serial and capped:
-// ffprobe on a network share is not free, and the answer for any one file
-// never changes, so there is no hurry and no reason to ask twice.
-//
-// `/list`'s `playable` field is the server's own persisted verdict (survives
-// a restart — see track_cache in db.js), so a file it already has an answer
-// for costs nothing to skip here. Only a file `/list` reports as `null` —
-// genuinely never probed — is worth a `/tracks/<id>` round trip; without this
-// check, every page load re-probed the entire library from scratch.
-async function probeLibrary() {
-  if (probing || !isHost) return;
-  probing = true;
-  try {
-    for (const f of library) {
-      if (playability.has(f.id)) continue;
-      // Already encoded, so whether the source is playable is moot.
-      if (f.encoded) continue;
-      if (f.playable != null) {
-        playability.set(f.id, { ok: f.playable, reasons: [] });
-        continue;
-      }
-      try {
-        const t = await fetch('/tracks/' + f.id).then((r) => r.json());
-        playability.set(f.id, t.play || { ok: true, reasons: [] });
-      } catch {
-        playability.set(f.id, { ok: true, reasons: [] });
-      }
-      renderEncode();
-    }
-  } finally {
-    probing = false;
-  }
-}
-
-// Everything worth showing: files that need converting, plus anything the
-// queue knows about regardless of whether it still does.
+// Rows come entirely from the queue itself — nothing here decides which
+// files "need" converting. The host picks that from the Library list.
 function encodeRows() {
   const byId = new Map();
-
-  for (const f of library) {
-    const verdict = playability.get(f.id);
-    const needs = verdict ? !verdict.ok : null;
-    // Unknown (not probed yet) and known-fine files are both left out — the
-    // panel is a work list, not a second copy of the library.
-    if (!f.encoded && needs !== true) continue;
-    byId.set(f.id, {
-      id: f.id,
-      label: f.label,
-      name: f.name,
-      encoded: f.encoded,
-      why: verdict?.reasons?.[0]?.text || '',
-      status: f.encoded ? 'ready' : 'none',
-      percent: 0,
-      error: null,
-    });
-  }
 
   for (const item of encodeData.items) {
     const row = byId.get(item.id) || {
@@ -2748,12 +2684,10 @@ function renderEncode() {
     encodeNote.textContent = 'ffmpeg is not installed on the server, so nothing can be converted.';
   } else if (!rows.length && orphans) {
     encodeNote.textContent =
-      `Nothing needs converting, but ${orphans} converted file${orphans === 1 ? '' : 's'} ` +
+      `Nothing queued, but ${orphans} converted file${orphans === 1 ? '' : 's'} ` +
       'no longer match anything in the library.';
   } else if (!rows.length) {
-    encodeNote.textContent = probing
-      ? 'Checking the library…'
-      : 'Nothing needs converting. Every file plays in the browser as it is.';
+    encodeNote.textContent = 'Nothing queued. Pick a file from the Library to convert it.';
   } else {
     encodeNote.textContent = busy
       ? `${busy} file${busy === 1 ? '' : 's'} to go. One converts at a time.`
@@ -2794,21 +2728,22 @@ function renderEncode() {
     : '';
   encodeClear.hidden = !rows.some((r) => r.status === 'done' || r.status === 'failed');
 
-  // Offered only once we positively know the playing file needs converting
-  // and isn't already queued or done — a shortcut so the host does not have
-  // to navigate there in the file list just to click the same button.
+  // Offered whenever the playing file isn't already encoded, queued or
+  // running — a shortcut so the host does not have to navigate there in the
+  // file list just to click the same button.
   const currentId = state?.src;
+  const currentFile = currentId ? library.find((f) => f.id === currentId) : null;
   const currentRow = currentId ? rows.find((r) => r.id === currentId) : null;
-  const currentNeedsAction = currentRow && (currentRow.status === 'none' || currentRow.status === 'failed');
+  const currentNeedsAction =
+    currentFile && !currentFile.encoded && (!currentRow || currentRow.status === 'failed');
   encodeCurrentBtn.hidden = !currentId || !currentNeedsAction || !encodeData.available;
   if (currentNeedsAction) {
-    encodeCurrentBtn.textContent =
-      currentRow.status === 'failed' ? 'Retry current' : 'Encode current';
-    encodeCurrentBtn.title = currentRow.label || '';
+    encodeCurrentBtn.textContent = currentRow?.status === 'failed' ? 'Retry current' : 'Encode current';
+    encodeCurrentBtn.title = currentFile.label || '';
   }
 
-  // The Library tab shows its own per-file encode badge, sourced from the
-  // same rows — keep it in step whenever the queue or a probe result changes.
+  // The Library tab shows its own per-file encode badge — keep it in step
+  // whenever the queue changes.
   renderLibrary();
 }
 
@@ -2844,10 +2779,10 @@ let picked = null;
 // back at the root, same as opening a real file browser fresh.
 let currentDir = [];
 
-// One button on the Library row itself for files that need converting,
-// failed, or are mid-conversion. Ready/not-yet-probed files show nothing
-// extra; the Encoding strip below the list remains the place to see the
-// whole queue, disk usage and orphans at once.
+// One button on the Library row itself: encode, retry, or progress/stop while
+// running. Already-encoded files show nothing extra; the Encoding strip below
+// the list remains the place to see the whole queue, disk usage and orphans
+// at once.
 function encodeBadge(row) {
   const wrap = document.createElement('span');
   wrap.className = 'file-enc';
@@ -2942,9 +2877,9 @@ function renderLibrary() {
     nameEl.textContent = f.name;
     li.appendChild(nameEl);
 
-    if (isHost) {
-      const enc = encodeRowsById.get(f.id);
-      if (enc) li.appendChild(encodeBadge(enc));
+    if (isHost && !f.encoded) {
+      const enc = encodeRowsById.get(f.id) || { id: f.id, status: 'none', percent: 0 };
+      li.appendChild(encodeBadge(enc));
     }
 
     const choose = () => {
